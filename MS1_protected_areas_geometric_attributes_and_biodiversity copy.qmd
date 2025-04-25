@@ -1,0 +1,891 @@
+---
+title: "Protected Areas Geometric Attributes and Biodiversity"
+author: 
+    - name: Gabriel Ortega
+    - name: Petr Keil
+    - name: Michela Perrone
+    - name: Daniela Mellado
+    - name: Manuele Bazzichetto
+abstract: |
+    Protected areas (PAs) design emphasizes shapes closer to a circle to reduce border effects. Kunin (1997) shows that plots with elongated shapes have more biodiversity. Kunin's findings are based on the principle that closer things are more similar, so elongated plots (ergo elongated PAs) should include things that are more distant between them, which are more likely to be different. While we cannot record species richness (or another diversity metric) worldwide simultaneously and with spatial accuracy, metrics derived from Earth Observation have been proposed as alternative proxies for biodiversity monitoring. The Spectral Variation Hypothesis proposes that geographic areas with high heterogeneity in remote images present high environmental heterogeneity, and therefore, support more biodiversity. 
+format: 
+    html: 
+        toc: true
+        toc-depth: 2
+        number-sections: true
+        code-fold: true
+---
+
+# Introduction
+
+-Protected areas purposes
+
+-Spatial design of protected areas Protected areas (PAs) design emphasizes shapes closer to a circle to reduce border effects.
+
+-Distance decay principle Kunin (1997) shows that plots with elongated shapes have more biodiversity. Kunin's findings are based on the principle that closer things are more similar, so elongated plots (ergo elongated PAs) should include things that are more distant between them, which are more likely to be different. While we cannot record species richness (or another diversity metric) worldwide simultaneously and with spatial accuracy, metrics derived from Earth Observation have been proposed as alternative proxies for biodiversity monitoring. The Spectral Variation Hypothesis proposes that geographic areas with high heterogeneity in remote images present high environmental heterogeneity, and therefore, support more biodiversity.
+
+-Relationship between geometric attributes and habitat heterogeneity The Spectral Variation Hypothesis proposes that geographic areas with high heterogeneity in remote images present high environmental heterogeneity, and therefore, support more biodiversity.
+
+-Here we address the relationship between geometric attributes and habitat heterogeneity in protected areas worldwide.
+
+-The fundamental principle behind all our hypotheses is the distance decay of similarity (Tobler’s law, Tobler XXX, Nekola & White 2001), which states that closer locations are more similar in environmental conditions and species composition than distant areas.
+
+# Hypotheses
+
+1.  **Heterogeneity increases with area**: Larger protected areas encompass a broader range of habitats by including more distant locations, thereby increasing habitat heterogeneity due to the principle of distance decay of similarity.
+2.  **Elongated PAs have more habitat heterogeneity**: Given constant area, elongated PAs cover longer environmental gradients than round PAs, increasing habitat heterogeneity due to the distance decay of similarity.
+3.  **Fragmented PAs harbor more heterogeneity**: Given constant area, fragmented PAs (measured as the number of polygons) are expected to have higher heterogeneity (Fahrig, Chase).
+4.  **Shape complexity increases heterogeneity**: Given constant area, PAs with higher shape complexity (measured as an area-to-perimeter ratio) are expected to have more heterogeneity.
+5.  **North-South extent increases heterogeneity**: Habitat heterogeneity increases with increasing North-South extent, as PAs capture the global latitudinal gradient of temperature and precipitation. This effect is detectable above a threshold value of extent.
+6.  **Wide elevational range**: Wider elevational ranges cover a higher variability in environmental conditions, increasing habitat heterogeneity.
+7.  **Bioclimatic zonation**: Bigger areas include more diverse climates and thus more habitat heterogeneity.
+
+We expect some of these metrics/hypotheses to be correlated with each other, and it may not be possible to separate their effects due to fundamental dependencies (Sizling et al. 2024).
+
+# Methods
+
+## Step 1: Protected areas dataset
+
+We used the December 2024 version of the World Database of Protected Areas. We restricted the analyses to terrestrial protected areas with area higher than zero and whose status is one of the following: "Designated", "Inscribed", "Adopted" or "Established". Each PA is identified with a WDPAID assigned by the UN Environment Programme World Conservation Monitoring Centre. However, protected areas could receive multiple administrative designations according to different institutions, resulting in multiple WDPAID for overlapping areas. For instance, part of a national park could be also a natural monument and be listed twice in the database. To avoid problems with overlapping areas we dissolved PAs sharing the same WDPAID and then identified all of the intersecting areas.
+
+```{sql}
+-- 1. Create initial geometry aggregation with spatial index
+CREATE MATERIALIZED VIEW admin.terrestrial_geometry_1 AS
+SELECT
+    wdpaid,
+    ST_UNION(geometry) AS geometry
+FROM public.wdpa_poly_dec2024
+WHERE marine = '0'
+  AND gis_area > 0
+  AND status IN ('Designated', 'Inscribed', 'Adopted', 'Established')
+GROUP BY wdpaid;
+```
+
+Add spatial index to speed up further processing.
+
+```{sql}
+CREATE INDEX tg1_geometry_idx ON admin.terrestrial_geometry_1 USING GIST(geometry);
+```
+
+Add an additional index on the unique identifier.
+
+```{sql}
+CREATE INDEX tg1_wdpaid_idx ON admin.terrestrial_geometry_1 (wdpaid);
+```
+
+Since some areas overlap, we created an additional table to identify the set of intersecting WDPAIDs per polygon.
+
+```{sql}
+-- 2. Create intersection analysis with optimized joins
+CREATE MATERIALIZED VIEW admin.terrestrial_intersections_2 AS
+SELECT
+    a.wdpaid,
+    ARRAY_AGG(DISTINCT b.wdpaid) AS intersecting_ids
+FROM admin.terrestrial_geometry_1 a
+JOIN admin.terrestrial_geometry_1 b 
+  ON a.wdpaid <> b.wdpaid
+  AND ST_INTERSECTS(a.geometry, b.geometry)
+GROUP BY a.wdpaid;
+```
+
+Add a spatial index to the new table.
+
+```{sql}
+CREATE INDEX ti2_wdpaid_idx ON admin.terrestrial_intersections_2 (wdpaid);
+```
+
+We create a combined view of the two previous tables.
+
+```{sql}
+-- 3. Create final combined view
+CREATE OR REPLACE VIEW admin.wdpaid_terrestrial_union AS
+SELECT
+    g.wdpaid,
+    g.geometry,
+    COALESCE(i.intersecting_ids, ARRAY[]::bigint[]) AS intersecting_ids
+FROM admin.terrestrial_geometry_1 g
+LEFT JOIN admin.terrestrial_intersections_2 i
+  ON g.wdpaid = i.wdpaid;
+```
+
+With the previous view in place we can create a materialized view to pull data from it.
+
+```{sql}
+-- 4. Create public-facing materialized view
+CREATE MATERIALIZED VIEW public.wdpaid_terrestrial_union AS
+SELECT * FROM admin.wdpaid_terrestrial_union;
+```
+
+Add a spatial index to the materialized view.
+
+```{sql}
+-- Add final indexes
+CREATE INDEX wtu_geometry_idx ON public.wdpaid_terrestrial_union USING GIST(geometry);
+```
+
+Add an index to the unique identifier in the materialized view.
+
+```{sql}
+CREATE INDEX wtu_wdpaid_idx ON public.wdpaid_terrestrial_union (wdpaid);
+```
+
+## Step 2: Characterization of Geometrical Dimensions
+
+We first characterized the fundamental geometrical dimensions (axes) of the PAs. This step is essential to address potential collinearities among geometrical characteristics. For instance, elongated areas may be large, round areas may be small, and fragmented areas may have low area-perimeter ratios.
+
+```{sql}
+-- 1. Geometry metrics view and materialized view
+CREATE OR REPLACE VIEW admin.matview_geometric_metrics
+ AS
+ SELECT data.wdpaid,
+    st_area(data.geometry::geography) / 1000000.0::double precision AS area_km2,
+        CASE
+            WHEN mbr.short > 0::double precision THEN mbr.long / mbr.short
+            ELSE 0::double precision
+        END AS elongationratio,
+    4.0::double precision * pi() * (st_area(data.geometry::geography) / 1000000.0::double precision) / NULLIF(power(st_perimeter(data.geometry::geography) / 1000.0::double precision, 2::double precision), 0::double precision) AS normcircularity,
+    st_numgeometries(data.geometry) AS numpolygons,
+    st_nrings(data.geometry) - st_numgeometries(data.geometry) AS numholes,
+        CASE
+            WHEN mbr.hull_area > 0::double precision THEN st_area(data.geometry::geography) / 1000000.0::double precision / mbr.hull_area
+            ELSE 0::double precision
+        END AS compactnessratio,
+        CASE
+            WHEN (st_perimeter(data.geometry::geography) / 1000.0::double precision) > 0::double precision AND (st_area(data.geometry::geography) / 1000000.0::double precision) > 0::double precision THEN 2.0::double precision * ln(st_perimeter(data.geometry::geography) / 1000.0::double precision) / ln(st_area(data.geometry::geography) / 1000000.0::double precision)
+            ELSE NULL::double precision
+        END AS fractaldimension
+   FROM wdpaid_terrestrial_union data
+     LEFT JOIN LATERAL ( SELECT st_area(st_convexhull(data.geometry)::geography) / 1000000.0::double precision AS hull_area,
+            st_distance(p1.p1::geography, p2.p2::geography) / 1000.0::double precision AS long,
+            st_distance(p2.p2::geography, p3.p3::geography) / 1000.0::double precision AS short
+           FROM st_orientedenvelope(data.geometry) oe(oe),
+            LATERAL st_pointn(st_exteriorring(oe.oe), 1) p1(p1),
+            LATERAL st_pointn(st_exteriorring(oe.oe), 2) p2(p2),
+            LATERAL st_pointn(st_exteriorring(oe.oe), 3) p3(p3)) mbr ON true;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.mv_geometric_metrics
+ SELECT * FROM admin.matview_geometric_metrics;
+
+----------------------------------------------------------------------------------------------------------
+-- 2. Extension metrics view and materialized view
+CREATE OR REPLACE VIEW admin.matview_spatial_extension
+ AS
+ SELECT wdpaid_terrestrial_union.wdpaid,
+    st_distance(st_makepoint(st_xmin(box.box::box3d), (st_ymin(box.box::box3d) + st_ymax(box.box::box3d)) / 2::double precision)::geography, st_makepoint(st_xmax(box.box::box3d), (st_ymin(box.box::box3d) + st_ymax(box.box::box3d)) / 2::double precision)::geography) / 1000::double precision AS ew_length,
+    st_distance(st_makepoint((st_xmin(box.box::box3d) + st_xmax(box.box::box3d)) / 2::double precision, st_ymin(box.box::box3d))::geography, st_makepoint((st_xmin(box.box::box3d) + st_xmax(box.box::box3d)) / 2::double precision, st_ymax(box.box::box3d))::geography) / 1000::double precision AS ns_length,
+    (( SELECT max(st_distance(a.geom::geography, b.geom::geography)) AS max
+           FROM st_dumppoints(st_convexhull(wdpaid_terrestrial_union.geometry)) a(path, geom),
+            st_dumppoints(st_convexhull(wdpaid_terrestrial_union.geometry)) b(path, geom))) / 1000::double precision AS maxlength_km
+   FROM wdpaid_terrestrial_union
+     CROSS JOIN LATERAL st_envelope(wdpaid_terrestrial_union.geometry) box(box);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.mv_extension_metrics
+ SELECT * FROM admin.matview_spatial_extension; 
+
+-----------------------------------------------------------------------------------------------------------
+-- 3. Combined view
+CREATE OR REPLACE VIEW public."MOBI_WDPA_land_combined_metrics"
+ AS
+ SELECT base.wdpaid,
+    base.intersecting_ids,
+    geom.area_km2 AS area,
+    geom.elongationratio,
+    geom.normcircularity,
+    geom.numpolygons,
+    geom.numholes,
+    geom.compactnessratio,
+    geom.fractaldimension,
+    ext.ew_length,
+    ext.ns_length,
+    ext.maxlength_km AS maxlength
+   FROM wdpaid_terrestrial_union base
+     JOIN mv_geometric_metrics geom USING (wdpaid)
+     JOIN mv_extension_metrics ext USING (wdpaid);
+```
+
+We extracted elevation data from Copernicus WorldEM-30.
+
+```{javascript}
+// Author: Gabriel Ortega
+
+// This script is organized in four sections:
+// 1. SETTINGS: Contains information about the input data and some pre-processing steps.
+// 2. FUNCTION(S): Main function(s) to apply.
+// 3. EXECUTION: Apply the function(s) to the input data.
+// 4. EXPORT RESULTS: Export outside of EarthEngine.
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// 1. SETTINGS
+
+// Polygons collection
+var pols = ee.FeatureCollection("WCMC/WDPA/current/polygons"); // Explicitly define WDPA polygons
+// Unique polygons identifier
+var uniqueID = 'WDPAID';
+
+// Elevation Dataset
+var elevationDataset = ee.ImageCollection("COPERNICUS/DEM/GLO30"); // Use the Copernicus DEM GLO 30m
+var elevationBand = 'DEM'; // Band name for elevation is 'DEM'
+var waterMaskBand = 'WBM'; // Band name for water mask is 'WBM'
+
+// Create a bounding box if necessary
+
+// Original bounding box coordinates
+var xmin = -180;    // left
+var ymin = 90;   // top
+var xmax = 180;  // right
+var ymax = -90;    // bottom
+
+// Define which box you want
+// Select box (0 = full, 1-16 = subdivisions)
+var whichBox = 16;  // Change this value
+
+// Initialize bbox variable
+var bbox;
+
+if (whichBox === 0) {
+  // Full bounding box
+  bbox = ee.Geometry.BBox(xmin, ymin, xmax, ymax);
+} else {
+  // Grid configuration (4x4)
+  var xSegments = 4;
+  var ySegments = 4;
+  
+  // Calculate step sizes
+  var xStep = (xmax - xmin)/xSegments;  // 45° per column
+  var yStep = (ymax - ymin)/ySegments;  // -22.5° per row
+  
+  // Convert whichBox (1-16) to grid indices
+  var adjustedIndex = whichBox - 1;
+  var row = Math.floor(adjustedIndex / xSegments);  // 0-3 (bottom to top)
+  var col = adjustedIndex % xSegments;              // 0-3 (left to right)
+  
+  // Reverse row order (original grid is top to bottom)
+  var yIndex = (ySegments - 1) - row;
+  
+  // Calculate coordinates
+  var xStart = xmin + col * xStep;
+  var xEnd = xStart + xStep;
+  var yStart = ymin + yIndex * yStep;
+  var yEnd = yStart + yStep;
+  
+  bbox = ee.Geometry.BBox(xStart, yStart, xEnd, yEnd);
+}
+
+
+// Name of output file
+var fileName = 'elevation_stats_WDPA_'+xmin+'_'+ymin+'_'+xmax+'_'+ymax+'_bbox'+whichBox;
+
+// Filter polygons dataset as required
+var filteredPols = pols
+  .filterBounds(bbox)
+  .filter(
+    ee.Filter.and(
+      ee.Filter.notNull([uniqueID]),
+      ee.Filter.eq('MARINE', '0'),
+      ee.Filter.gt('GIS_AREA', 0),  // Added gis_area > 0 filter
+      ee.Filter.inList('STATUS', [  // Added status filter
+        'Designated',
+        'Inscribed',
+        'Adopted',
+        'Established'
+      ])
+    )
+  );
+
+
+// Group polygons by WDPA_PID and combine their geometries.
+var uniquePolID = filteredPols.aggregate_array(uniqueID).distinct().map(function(id) {
+  var collection = filteredPols.filter(ee.Filter.eq(uniqueID, id));
+  // Combine geometries using a unary union (merging all geometries in the collection).
+  var combinedGeometry = collection.geometry().dissolve(); // Use dissolve to combine all geometries
+  return ee.Feature(combinedGeometry, {WDPAID: id});
+});
+
+// Convert to FeatureCollection
+var uniquePolygons = ee.FeatureCollection(uniquePolID);
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// 2. FUNCTION(S)
+
+var processElevation = function() {
+
+  var features = uniquePolygons.map(function(feature) {
+    var combinedGeometry = feature.geometry();
+
+    // Get the elevation and water mask bands.  Since elevationDataset is a collection, we need to mosaic it.
+    var elevation = elevationDataset.select(elevationBand).mosaic();
+    var waterMask = elevationDataset.select(waterMaskBand).mosaic();
+
+    // Apply the water mask:
+    // WBM values: 0=No water, 1=Ocean, 2=Lake, 3=River.
+    // We want to include land, which is WBM == 0.
+    var maskedElevation = elevation.updateMask(waterMask.eq(0)); // Keep only where WBM == 0
+
+    // Calculate elevation statistics.
+    var stats = maskedElevation.reduceRegion({
+      reducer: ee.Reducer.min()
+        .combine(ee.Reducer.max(), null, true)
+        .combine(ee.Reducer.mean(), null, true)
+        .combine(ee.Reducer.stdDev(), null, true),
+      geometry: combinedGeometry,
+      scale: 30,
+      maxPixels: 1e13,
+      bestEffort: true
+    });
+
+    var renamedStats = {
+        elevation_min: stats.get('DEM_min'),
+        elevation_max: stats.get('DEM_max'),
+        elevation_mean: stats.get('DEM_mean'),
+        elevation_stdDev: stats.get('DEM_stdDev'),
+    };
+    return ee.Feature(null, renamedStats).set(uniqueID, feature.get(uniqueID));
+  });
+
+  return ee.FeatureCollection(features);
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// 3. EXECUTION
+
+var allFeatures = processElevation();
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// 4. EXPORT RESULTS
+
+Export.table.toDrive({
+  collection: allFeatures,
+  description: fileName,
+  fileFormat: 'CSV',
+  folder: 'Earthengine_exports'
+});
+```
+
+We extracted climate data from ...
+
+```{javascript}
+// Authors: Gabriel Ortega
+
+// This script is organized in four sections:
+// 1. SETTINGS: Contains information about the input data and some pre-processing steps.
+// 2. FUNCTION(S): Main function(s) to apply.
+// 3. EXECUTION: Apply the function(s) to the input data.
+// 4. EXPORT RESULTS: Export outside of EarthEngine.
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// 1. SETTINGS
+
+// Polygons collection
+var pols = ee.FeatureCollection("WCMC/WDPA/current/polygons"); // Explicitly define WDPA polygons
+// Unique polygons identifier
+var uniqueID = 'WDPAID';
+// Climate Dataset
+var climateDataset = ee.Image('projects/gortega-research/assets/koppen_geiger_0p01'); // Koppen-Geiger climate zones
+var climateBand = 'b1'; // Band name for climate classification
+
+// Create a bounding box if necessary
+
+// Original bounding box coordinates
+var xmin = -180;    // left
+var ymin = 90;   // top
+var xmax = 180;  // right
+var ymax = -90;    // bottom
+
+// Define which box you want
+// Select box (0 = full, 1-16 = subdivisions)
+var whichBox = 16;  // Change this value
+
+// Initialize bbox variable
+var bbox;
+
+if (whichBox === 0) {
+  // Full bounding box
+  bbox = ee.Geometry.BBox(xmin, ymin, xmax, ymax);
+} else {
+  // Grid configuration (4x4)
+  var xSegments = 4;
+  var ySegments = 4;
+  
+  // Calculate step sizes
+  var xStep = (xmax - xmin)/xSegments;  // 45° per column
+  var yStep = (ymax - ymin)/ySegments;  // -22.5° per row
+  
+  // Convert whichBox (1-16) to grid indices
+  var adjustedIndex = whichBox - 1;
+  var row = Math.floor(adjustedIndex / xSegments);  // 0-3 (bottom to top)
+  var col = adjustedIndex % xSegments;              // 0-3 (left to right)
+  
+  // Reverse row order (original grid is top to bottom)
+  var yIndex = (ySegments - 1) - row;
+  
+  // Calculate coordinates
+  var xStart = xmin + col * xStep;
+  var xEnd = xStart + xStep;
+  var yStart = ymin + yIndex * yStep;
+  var yEnd = yStart + yStep;
+  
+  bbox = ee.Geometry.BBox(xStart, yStart, xEnd, yEnd);
+}
+
+
+// Name of output file
+var fileName = 'climate_analysis_WDPA_'+xmin+'_'+ymin+'_'+xmax+'_'+ymax+'_bbox'+whichBox;
+
+// Filter polygons dataset as required
+var filteredPols = pols
+  .filterBounds(bbox)
+  .filter(
+    ee.Filter.and(
+      ee.Filter.notNull([uniqueID]),
+      ee.Filter.eq('MARINE', '0'),  // Keep only land areas
+      ee.Filter.gt('GIS_AREA', 0),  // Keep gis_area > 0 filter
+      ee.Filter.inList('STATUS', [  // Keep status in list
+        'Designated',
+        'Inscribed',
+        'Adopted',
+        'Established'
+      ])
+    )
+  );
+
+
+// Group polygons by WDPAID and combine their geometries.
+var groupedPolygons = filteredPols.aggregate_array(uniqueID).distinct().map(function(id) {
+  var collection = filteredPols.filter(ee.Filter.eq(uniqueID, id));
+  // Combine geometries using a unary union (merging all geometries in the collection).
+  var combinedGeometry = collection.geometry().dissolve(); // Use dissolve to combine all geometries
+  return ee.Feature(combinedGeometry, {WDPAID: id});
+});
+
+// Convert to FeatureCollection
+var uniquePolygons = ee.FeatureCollection(groupedPolygons);
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// 2. FUNCTION(S)
+var processData = function() {
+
+  var features = uniquePolygons.map(function(feature) {
+    var combinedGeometry = feature.geometry();
+
+    // Get the climate data.
+    var climate = climateDataset.select(climateBand);
+
+    // Use a histogram to get the pixel counts for each climate category within the combined polygon.
+    var climateStats = climate.reduceRegion({
+        reducer: ee.Reducer.histogram(),
+        geometry: combinedGeometry,
+        scale: 100,
+        maxPixels: 1e13
+    });
+
+    // Get the total number of pixels in the combined polygon.
+    var totalPixels = climate.reduceRegion({
+        reducer: ee.Reducer.count(),
+        geometry: combinedGeometry,
+        scale: 100,
+        maxPixels: 1e13
+    }).get(climateBand);
+
+    var results = {
+        climate_histogram: climateStats.get(climateBand),
+        total_pixels: totalPixels
+    };
+
+    return ee.Feature(null, results).set(uniqueID, feature.get(uniqueID));
+  });
+
+  return ee.FeatureCollection(features);
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// 3. EXECUTION
+
+var allFeatures = processData();
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// 4. EXPORT RESULTS
+Export.table.toDrive({
+  collection: allFeatures,
+  description: fileName,
+  fileFormat: 'CSV',
+  folder: 'Earthengine_exports'
+});
+```
+
+Finally we extracted NDVI data from
+
+```{javascript}
+// Authors: Gabriel Ortega & Michela Perrone
+
+// This script is organized in four sections:
+// 1. SETTINGS: Contains information about the input data and some pre-processing steps.
+// 2. FUNCTION(S): Main function(s) to apply.
+// 3. EXECUTION: Apply the function(s) to the input data.
+// 4. EXPORT RESULTS: Export outside of EarthEngine.
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// 1. SETTINGS
+
+// Rasters collection
+var collection = 'MODIS/061/MOD13Q1';
+
+// Polygons collection
+var pols = ee.FeatureCollection('WCMC/WDPA/current/polygons');
+
+// Unique polygons identifier
+var uniqueID = 'WDPAID';
+
+// Set years of interest
+var startYear = 2000;
+var endYear = 2024;
+
+// Select bands of interest
+var bands = ['NDVI', 'EVI'];
+var qualityBand = 'SummaryQA';
+var qualityValue = 0;
+var scaleFactor = 0.0001;
+
+// Create a bounding box if necessary
+
+// Original bounding box coordinates
+var xmin = -180;    // left
+var ymin = 90;   // top
+var xmax = 180;  // right
+var ymax = -90;    // bottom
+
+// Define which box you want
+// Select box (0 = full, 1-16 = subdivisions)
+var whichBox = 16;  // Change this value
+
+// Initialize bbox variable
+var bbox;
+
+if (whichBox === 0) {
+  // Full bounding box
+  bbox = ee.Geometry.BBox(xmin, ymin, xmax, ymax);
+} else {
+  // Grid configuration (4x4)
+  var xSegments = 4;
+  var ySegments = 4;
+  
+  // Calculate step sizes
+  var xStep = (xmax - xmin)/xSegments;  // 45° per column
+  var yStep = (ymax - ymin)/ySegments;  // -22.5° per row
+  
+  // Convert whichBox (1-16) to grid indices
+  var adjustedIndex = whichBox - 1;
+  var row = Math.floor(adjustedIndex / xSegments);  // 0-3 (bottom to top)
+  var col = adjustedIndex % xSegments;              // 0-3 (left to right)
+  
+  // Reverse row order (original grid is top to bottom)
+  var yIndex = (ySegments - 1) - row;
+  
+  // Calculate coordinates
+  var xStart = xmin + col * xStep;
+  var xEnd = xStart + xStep;
+  var yStart = ymin + yIndex * yStep;
+  var yEnd = yStart + yStep;
+  
+  bbox = ee.Geometry.BBox(xStart, yStart, xEnd, yEnd);
+}
+
+
+// Name of output file
+var fileName = 'mean_sd_NDVI_EVI_WDPA_' + xmin + '_' + ymin + '_' + xmax + '_' + ymax + '_' + startYear + '_' + endYear+'_bbox'+whichBox;
+
+// Filter polygons dataset as required
+var filteredPols = pols
+  .filterBounds(bbox)
+  .filter(
+    ee.Filter.and(
+      ee.Filter.notNull([uniqueID]),
+      ee.Filter.eq('MARINE', '0'),
+      ee.Filter.gt('GIS_AREA', 0),  // Added gis_area > 0 filter
+      ee.Filter.inList('STATUS', [  // Added status filter
+        'Designated',
+        'Inscribed',
+        'Adopted',
+        'Established'
+      ])
+    )
+  );
+
+
+// Group polygons by WDPA_PID and combine their geometries.
+var uniquePolID = filteredPols.aggregate_array(uniqueID).distinct().map(function(id) {
+  var collection = filteredPols.filter(ee.Filter.eq(uniqueID, id));
+  // Combine geometries using a unary union (merging all geometries in the collection).
+  var combinedGeometry = collection.geometry().dissolve(); // Use dissolve to combine all geometries
+  return ee.Feature(combinedGeometry, {WDPAID: id});
+});
+
+// Convert to FeatureCollection
+var uniquePolygons = ee.FeatureCollection(uniquePolID);
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// 2. FUNCTION(S)
+
+var processYear = function(year) {
+  var startDate = ee.Date.fromYMD(year, 1, 1); // Indicate a starting date
+  var endDate = ee.Date.fromYMD(ee.Number(year).add(1), 1, 1); // Indicate an ending date
+
+  // 2.1. Image Processing:
+  var processedImage = ee.ImageCollection(collection)
+    .filterDate(startDate, endDate) // Filter start and end dates
+    .select(bands.concat([qualityBand])) // Add the quality band to selection
+    .map(function(image) {
+      var qualityMask = image.select(qualityBand).eq(qualityValue); // Create a quality mask
+      return image.updateMask(qualityMask).select(bands); // Apply the quality mask to each image
+    })
+    .reduce(ee.Reducer.percentile([90])) // Reduce all the overlapped image-pixels to a single one
+    .multiply(scaleFactor); // Apply the corresponding scale factor
+  
+  // 2.2. Feature Generation:
+  var features = uniquePolygons.map(function(feature) {
+    var combinedGeometry = feature.geometry();
+    
+    // 2.3. Get variables of interest:
+    var stats = processedImage.reduceRegion({
+      reducer: ee.Reducer.mean().combine(ee.Reducer.stdDev(), null, true),
+      geometry: combinedGeometry,
+      scale: 250,        // Cell size
+      maxPixels: 1e13,    // Increase if needed for large polygons
+      bestEffort: true
+    });
+
+    // 2.4. Return annual results
+    return ee.Feature(null, stats).set(uniqueID, feature.get(uniqueID)).set('year', year);
+  });
+
+  // 2.5. Return all results
+  return ee.FeatureCollection(features);
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// 3. EXECUTION
+
+var allFeatures = ee.FeatureCollection(
+  ee.List.sequence(startYear, endYear).map(processYear).flatten()
+).flatten();
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// 4. EXPORT RESULTS
+
+Export.table.toDrive({
+  collection: allFeatures,
+  description: fileName,
+  fileFormat: 'CSV',
+  folder: 'Earthengine_exports'
+});
+```
+
+Merge data
+
+```{bash}
+mkdir -p /tmp/data
+unzip data.zip -d /tmp/data/
+```
+
+### Data preparation
+
+```{r}
+pacman::p_load(tidyverse)
+climate <- list.files("/tmp/data/", full.names = T, pattern = "climate_analysis") %>% lapply(., read_csv) %>% data.table::rbindlist(fill = T) %>% select(-1, -.geo)
+elevation <- list.files("/tmp/data/", full.names = T, pattern = "elevation_stats") %>% lapply(., read_csv) %>% data.table::rbindlist(fill = T) %>% select(-1, -.geo)
+ndvi <- list.files("/tmp/data/", full.names = T, pattern = "mean_sd_NDVI") %>% lapply(., read_csv) %>% data.table::rbindlist(fill = T) %>% select(-1, -.geo)
+data <- list.files("/tmp/data/", full.names = T, pattern = "^MOBI_") %>% read_csv() %>% rename(WDPAID = wdpaid)
+```
+
+#### Climate
+
+```{r}
+# Process the climate data to extract and calculate relevant metrics
+climate <- climate %>%
+    mutate(
+        # Extract the minimum bucket value from the climate histogram using regex
+        bucketMin = as.numeric(str_extract(climate_histogram, "bucketMin=([0-9.]+)") %>% str_extract("[0-9.]+")),
+        
+        # Extract the bucket width from the climate histogram using regex
+        bucketWidth = as.numeric(str_extract(climate_histogram, "bucketWidth=([0-9.]+)") %>% str_extract("[0-9.]+")),
+        
+        # Extract the histogram values as a numeric list using regex and string manipulation
+        histogram = str_extract(climate_histogram, "(?<=histogram\\=)\\[.*?\\]") %>%
+            str_remove_all("\\[|\\]") %>%
+            str_split(",\\s*") %>%
+            map(as.numeric),
+        
+        # Calculate the number of climate categories (bins) in the histogram
+        n_climates = map_dbl(histogram, length),
+        
+        # Convert histogram values to numeric for further processing
+        histogram_numeric = map(histogram, as.numeric)
+    ) %>%
+    group_by(WDPAID) %>%
+    summarise(
+        # Calculate the mean values for numeric columns (bucketMin, bucketWidth, n_climates)
+        across(c(bucketMin, bucketWidth, n_climates), mean),
+        
+        # Compute the element-wise average of histogram lists across grouped data
+        histogram_numeric = list(
+            reduce(map(histogram_numeric, ~ {
+                vec <- .x
+                length(vec) <- max(lengths(histogram_numeric)) # Ensure all vectors have the same length
+                replace_na(vec, 0) # Replace NA values with 0
+            }), `+`) / n()
+        )
+    ) %>%
+    mutate(
+        # Calculate Shannon diversity index for each histogram
+        shannon = map_dbl(histogram_numeric, ~ {
+            counts <- .x[.x > 0] # Filter out zero counts
+            if(length(counts) == 0) return(0) # Return 0 if no counts exist
+            p <- counts / sum(counts) # Calculate proportions
+            -sum(p * log(p)) # Compute Shannon index
+        }),
+        
+        # Calculate Simpson diversity index for each histogram
+        simpson = map_dbl(histogram_numeric, ~ {
+            counts <- .x[.x > 0] # Filter out zero counts
+            if(length(counts) == 0) return(0) # Return 0 if no counts exist
+            p <- counts / sum(counts) # Calculate proportions
+            1 - sum(p^2) # Compute Simpson index
+        }),
+        
+        # Calculate evenness index for each histogram
+        evenness = map_dbl(histogram_numeric, ~ {
+            counts <- .x[.x > 0] # Filter out zero counts
+            if(length(counts) == 0) return(1) # Return 1 if no counts exist
+            p <- counts / sum(counts) # Calculate proportions
+            H <- -sum(p * log(p)) # Compute Shannon index
+            S <- length(counts) # Number of categories
+            ifelse(S > 1, H / log(S), 1) # Compute evenness index
+        })
+    )
+```
+
+#### Elevation
+
+```{r}
+elevation <- elevation %>%
+    group_by(WDPAID) %>%
+    summarise(across(everything(), mean))
+```
+
+#### NDVI - EVI
+
+```{r}
+ndvi <- ndvi %>%
+select(-year) %>%
+group_by(WDPAID) %>%
+summarise(EVI_p90_mean = mean(EVI_p90_mean),
+NDVI_p90_mean = mean(NDVI_p90_mean),
+EVI_p90_stdDev = sqrt(mean(EVI_p90_stdDev^2)),
+NDVI_p90_stdDev = sqrt(mean(NDVI_p90_stdDev^2))) %>%
+mutate(cv_evi = EVI_p90_stdDev/EVI_p90_mean,
+cv_ndvi = NDVI_p90_stdDev/NDVI_p90_mean)
+```
+
+### Merge all datasets
+
+```{r}
+# Perform joins and handle missing values
+data <- data %>%
+  left_join(climate, by = "WDPAID") %>%
+  left_join(elevation, by = "WDPAID") %>%
+  left_join(ndvi, by = "WDPAID") %>%
+  drop_na()
+ # Use drop_na() to remove rows with missing values
+```
+
+## Step 2: Analysis
+
+-   PCA with all attributes of protected areas.
+
+```{r}
+# Load required packages
+pacman::p_load(ggplot2, FactoMineR, factoextra, dplyr)
+
+# Prepare data for PCA
+pca_data <- data %>% na.omit() %>%
+  dplyr::select(-matches("WDPAID|^intersecting|^bucket|histogram_numeric|stdDev$|^EVI|^NDVI|cv_evi|cv_ndvi")) %>%
+  filter(area > 10)
+
+# Perform PCA
+pca_result <- PCA(pca_data, scale.unit = TRUE, graph = FALSE)
+
+# Visualize PCA results
+fviz_pca_biplot(pca_result, 
+                repel = TRUE, 
+                col.var = "blue", 
+                col.ind = "gray",
+                title = "PCA Biplot of Geometric Attributes")
+```
+
+-   **H1**: Test the relationship between elongation and CV-EVI (and CV-NDVI) while controlling for area.
+-   **H2**: Test the marginal effect of length in the North-South axis.
+-   **H3**: \[Details to be added\].
+-   **H4**: \[Details to be added\].
+
+## Interpreting most important variables from random forest
+
+-   Identify the threshold for North-South extent and CV-EVI.
+
+```{r}
+# Load required package
+pacman::p_load(segmented)
+
+# Fit linear model
+lm_model <- lm(cv_evi ~ ns_length, data = data)
+
+# Apply segmented regression
+segmented_model <- segmented(lm_model, seg.Z = ~ns_length)
+
+# Extract breakpoints
+breakpoints <- segmented_model$psi[, "Est."]
+print(breakpoints)
+
+# Get fitted values
+fitted_values <- fitted(segmented_model)
+```
+
+# Results
+
+## Figure 1
+
+PCA figure goes here.
+
+```{r}
+# Create density surface plot with variable importance arrows
+ggplot(pca_scores, aes(x = PC1, y = PC2)) +
+    stat_density_2d(aes(fill = ..level..), geom = "polygon", color = NA, alpha = 0.7) +  # Density surface
+    scale_fill_viridis_c() +
+    geom_segment(data = pca_loadings, aes(x = 0, y = 0, xend = PC1 * 5, yend = PC2 * 5),
+                 arrow = arrow(length = unit(0.2, "cm")), color = "red") +
+    geom_text(data = pca_loadings, aes(x = PC1 * 5, y = PC2 * 5, label = rownames(pca_loadings)),
+              hjust = 1.2, vjust = 1.2, color = "red") +
+    labs(x = "Principal Component 1", y = "Principal Component 2") +
+    ggpubr::theme_pubr()
+```
+
+## Figure XX
+
+-Interpreting most important variables
+
+```{r}
+# Plot results
+library(ggplot2)
+plot_data <- data.frame(ns_length = data$ns_length, cv_evi = data$cv_evi, Fitted = fitted_values)
+
+ggplot(plot_data, aes(x = ns_length, y = cv_evi)) +
+    geom_point() + 
+    geom_line(aes(y = Fitted), color = "blue") + 
+    geom_vline(xintercept = breakpoints, linetype = "dashed", color = "red") + 
+    labs(title = "Segmented Regression", x = "North-South Length", y = "CV-EVI") + 
+    ggpubr::theme_pubr()
+```
+
+# Discussion
+
+\[Discussion content to be added.\]
+
+Nature protection often has complex goals: Šumava National Park and Czech Switzerland National Park are prime examples of protected areas where protecting landscape character is almost as important as protecting habitats and biodiversity.

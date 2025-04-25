@@ -1,0 +1,60 @@
+---
+title: "Protected Areas Geometric Attributes and Biodiversity"
+author: 
+    - name: Gabriel Ortega
+    - name: Petr Keil
+    - name: Michela Perrone
+    - name: Daniela Mellado
+    - name: Manuele Bazzichetto
+abstract: |
+    Protected areas (PAs) design emphasizes shapes closer to a circle to reduce border effects. Kunin (1997) shows that plots with elongated shapes have more biodiversity. Kunin's findings are based on the principle that closer things are more similar, so elongated plots (ergo elongated PAs) should include things that are more distant between them, which are more likely to be different. While we cannot record species richness (or another diversity metric) worldwide simultaneously and with spatial accuracy, metrics derived from Earth Observation have been proposed as alternative proxies for biodiversity monitoring. The Spectral Variation Hypothesis proposes that geographic areas with high heterogeneity in remote images present high environmental heterogeneity, and therefore, support more biodiversity. 
+format: 
+    html: 
+        toc: true
+        toc-depth: 2
+        number-sections: true
+        code-fold: true
+---
+
+# Introduction
+
+Protected areas (PAs) design emphasizes shapes closer to a circle to reduce border effects. Kunin (1997) shows that plots with elongated shapes have more biodiversity. Kunin's findings are based on the principle that closer things are more similar, so elongated plots (ergo elongated PAs) should include things that are more distant between them, which are more likely to be different. While we cannot record species richness (or another diversity metric) worldwide simultaneously and with spatial accuracy, metrics derived from Earth Observation have been proposed as alternative proxies for biodiversity monitoring. The Spectral Variation Hypothesis proposes that geographic areas with high heterogeneity in remote images present high environmental heterogeneity, and therefore, support more biodiversity.
+
+Nature protection often has complex goals: Šumava National Park and Czech Switzerland National Park are prime examples of protected areas where protecting landscape character is almost as important as protecting habitats and biodiversity.
+
+The fundamental principle behind all our hypotheses is the distance decay of similarity (Tobler’s law, Tobler XXX, Nekola & White 2001), which states that closer locations are more similar in environmental conditions and species composition than distant areas.
+
+# Hypotheses
+
+1. **Heterogeneity increases with area**: This is the trivial null expectation. All of the other hypotheses are built on top of that and assume that the effect of area is controlled for (statistically).
+2. **Elongated PAs have more habitat heterogeneity**: Given constant area, elongated PAs cover longer environmental gradients than round PAs, increasing habitat heterogeneity due to the distance decay of similarity.
+3. **Fragmented PAs harbor more heterogeneity**: Given constant area, fragmented PAs (measured as the number of polygons) are expected to have higher heterogeneity (Fahrig, Chase).
+4. **Shape complexity increases heterogeneity**: Given constant area, PAs with higher shape complexity (measured as an area-to-perimeter ratio) are expected to have more heterogeneity.
+5. **North-South extent increases heterogeneity**: Habitat heterogeneity increases with increasing North-South extent, as PAs capture the global latitudinal gradient of temperature and precipitation. This effect is detectable only above a certain threshold value of extent.
+6. **Core area increases heterogeneity**: Habitat heterogeneity increases in PAs with larger core areas (maximum inscribed circle), potentially due to reduced edge effects, though the mechanism is less clear.
+
+We expect some of these metrics/hypotheses to be correlated with each other, and it may not be possible to separate their effects due to fundamental dependencies (Sizling et al. 2024).
+
+# Methods
+
+## Step 1: Characterization of Geometrical Dimensions
+
+We first characterized the fundamental geometrical dimensions (axes) of the PAs. This step is essential to address potential collinearities among geometrical characteristics. For instance, elongated areas may be large, round areas may be small, and fragmented areas may have low area-perimeter ratios.
+
+## Step 2: Analysis
+
+- Identify the threshold for North-South extent and CV-EVI.
+- **H1**: Test the relationship between elongation and CV-EVI (and CV-NDVI) while controlling for area.
+- **H2**: Test the marginal effect of length in the North-South axis.
+- **H3**: [Details to be added].
+- **H4**: [Details to be added].
+
+# Results
+
+## Figure 1
+
+PCA figure goes here.
+
+# Discussion
+
+[Discussion content to be added.]
