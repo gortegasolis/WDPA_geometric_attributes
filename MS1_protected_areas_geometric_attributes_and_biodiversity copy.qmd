@@ -1,19 +1,21 @@
 ---
 title: "Protected Areas Geometric Attributes and Biodiversity"
 author: 
-    - name: Gabriel Ortega
-    - name: Petr Keil
-    - name: Michela Perrone
-    - name: Daniela Mellado
-    - name: Manuele Bazzichetto
+  - name: Gabriel Ortega
+  - name: Petr Keil
+  - name: Michela Perrone
+  - name: Daniela Mellado
+  - name: Manuele Bazzichetto
 abstract: |
-    Protected areas (PAs) design emphasizes shapes closer to a circle to reduce border effects. Kunin (1997) shows that plots with elongated shapes have more biodiversity. Kunin's findings are based on the principle that closer things are more similar, so elongated plots (ergo elongated PAs) should include things that are more distant between them, which are more likely to be different. While we cannot record species richness (or another diversity metric) worldwide simultaneously and with spatial accuracy, metrics derived from Earth Observation have been proposed as alternative proxies for biodiversity monitoring. The Spectral Variation Hypothesis proposes that geographic areas with high heterogeneity in remote images present high environmental heterogeneity, and therefore, support more biodiversity. 
+  Protected areas (PAs) design emphasizes shapes closer to a circle to reduce border effects. Kunin (1997) shows that plots with elongated shapes have more biodiversity. Kunin's findings are based on the principle that closer things are more similar, so elongated plots (ergo elongated PAs) should include things that are more distant between them, which are more likely to be different. While we cannot record species richness (or another diversity metric) worldwide simultaneously and with spatial accuracy, metrics derived from Earth Observation have been proposed as alternative proxies for biodiversity monitoring. The Spectral Variation Hypothesis proposes that geographic areas with high heterogeneity in remote images present high environmental heterogeneity, and therefore, support more biodiversity. 
 format: 
-    html: 
-        toc: true
-        toc-depth: 2
-        number-sections: true
-        code-fold: true
+  html: 
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: true
+execute:
+  eval: false
 ---
 
 # Introduction
@@ -690,10 +692,22 @@ unzip data.zip -d /tmp/data/
 
 ```{r}
 pacman::p_load(tidyverse)
-climate <- list.files("/tmp/data/", full.names = T, pattern = "climate_analysis") %>% lapply(., read_csv) %>% data.table::rbindlist(fill = T) %>% select(-1, -.geo)
-elevation <- list.files("/tmp/data/", full.names = T, pattern = "elevation_stats") %>% lapply(., read_csv) %>% data.table::rbindlist(fill = T) %>% select(-1, -.geo)
-ndvi <- list.files("/tmp/data/", full.names = T, pattern = "mean_sd_NDVI") %>% lapply(., read_csv) %>% data.table::rbindlist(fill = T) %>% select(-1, -.geo)
-data <- list.files("/tmp/data/", full.names = T, pattern = "^MOBI_") %>% read_csv() %>% rename(WDPAID = wdpaid)
+climate <- list.files("/tmp/data/", full.names = T, pattern = "climate_analysis") %>%
+    lapply(., read_csv) %>%
+    data.table::rbindlist(fill = T) %>%
+    select(-1, -.geo)
+elevation <- list.files("/tmp/data/", full.names = T, pattern = "elevation_stats") %>%
+    lapply(., read_csv) %>%
+    data.table::rbindlist(fill = T) %>%
+    select(-1, -.geo)
+ndvi <- list.files("/tmp/data/", full.names = T, pattern = "mean_sd_NDVI") %>%
+    lapply(., read_csv) %>%
+    data.table::rbindlist(fill = T) %>%
+    select(-1, -.geo)
+coords <- list.files("/tmp/data/", full.names = T, pattern = "WDPA_lat") %>% read_csv(col_select = -4)
+data <- list.files("/tmp/data/", full.names = T, pattern = "^MOBI_") %>%
+    read_csv() %>%
+    rename(WDPAID = wdpaid)
 ```
 
 #### Climate
@@ -704,19 +718,19 @@ climate <- climate %>%
     mutate(
         # Extract the minimum bucket value from the climate histogram using regex
         bucketMin = as.numeric(str_extract(climate_histogram, "bucketMin=([0-9.]+)") %>% str_extract("[0-9.]+")),
-        
+
         # Extract the bucket width from the climate histogram using regex
         bucketWidth = as.numeric(str_extract(climate_histogram, "bucketWidth=([0-9.]+)") %>% str_extract("[0-9.]+")),
-        
+
         # Extract the histogram values as a numeric list using regex and string manipulation
         histogram = str_extract(climate_histogram, "(?<=histogram\\=)\\[.*?\\]") %>%
             str_remove_all("\\[|\\]") %>%
             str_split(",\\s*") %>%
             map(as.numeric),
-        
+
         # Calculate the number of climate categories (bins) in the histogram
         n_climates = map_dbl(histogram, length),
-        
+
         # Convert histogram values to numeric for further processing
         histogram_numeric = map(histogram, as.numeric)
     ) %>%
@@ -724,7 +738,7 @@ climate <- climate %>%
     summarise(
         # Calculate the mean values for numeric columns (bucketMin, bucketWidth, n_climates)
         across(c(bucketMin, bucketWidth, n_climates), mean),
-        
+
         # Compute the element-wise average of histogram lists across grouped data
         histogram_numeric = list(
             reduce(map(histogram_numeric, ~ {
@@ -738,23 +752,29 @@ climate <- climate %>%
         # Calculate Shannon diversity index for each histogram
         shannon = map_dbl(histogram_numeric, ~ {
             counts <- .x[.x > 0] # Filter out zero counts
-            if(length(counts) == 0) return(0) # Return 0 if no counts exist
+            if (length(counts) == 0) {
+                return(0)
+            } # Return 0 if no counts exist
             p <- counts / sum(counts) # Calculate proportions
             -sum(p * log(p)) # Compute Shannon index
         }),
-        
+
         # Calculate Simpson diversity index for each histogram
         simpson = map_dbl(histogram_numeric, ~ {
             counts <- .x[.x > 0] # Filter out zero counts
-            if(length(counts) == 0) return(0) # Return 0 if no counts exist
+            if (length(counts) == 0) {
+                return(0)
+            } # Return 0 if no counts exist
             p <- counts / sum(counts) # Calculate proportions
             1 - sum(p^2) # Compute Simpson index
         }),
-        
+
         # Calculate evenness index for each histogram
         evenness = map_dbl(histogram_numeric, ~ {
             counts <- .x[.x > 0] # Filter out zero counts
-            if(length(counts) == 0) return(1) # Return 1 if no counts exist
+            if (length(counts) == 0) {
+                return(1)
+            } # Return 1 if no counts exist
             p <- counts / sum(counts) # Calculate proportions
             H <- -sum(p * log(p)) # Compute Shannon index
             S <- length(counts) # Number of categories
@@ -768,57 +788,141 @@ climate <- climate %>%
 ```{r}
 elevation <- elevation %>%
     group_by(WDPAID) %>%
-    summarise(across(everything(), mean))
+    summarise(across(everything(), mean)) %>%
+    mutate(
+        elevation_range = elevation_max - elevation_min,
+        elevation_cv = elevation_stdDev / elevation_mean
+    )
 ```
 
 #### NDVI - EVI
 
 ```{r}
 ndvi <- ndvi %>%
-select(-year) %>%
-group_by(WDPAID) %>%
-summarise(EVI_p90_mean = mean(EVI_p90_mean),
-NDVI_p90_mean = mean(NDVI_p90_mean),
-EVI_p90_stdDev = sqrt(mean(EVI_p90_stdDev^2)),
-NDVI_p90_stdDev = sqrt(mean(NDVI_p90_stdDev^2))) %>%
-mutate(cv_evi = EVI_p90_stdDev/EVI_p90_mean,
-cv_ndvi = NDVI_p90_stdDev/NDVI_p90_mean)
+    select(-year) %>%
+    group_by(WDPAID) %>%
+    summarise(
+        EVI_p90_mean = mean(EVI_p90_mean),
+        NDVI_p90_mean = mean(NDVI_p90_mean),
+        EVI_p90_stdDev = sqrt(mean(EVI_p90_stdDev^2)),
+        NDVI_p90_stdDev = sqrt(mean(NDVI_p90_stdDev^2))
+    ) %>%
+    mutate(
+        cv_evi = EVI_p90_stdDev / EVI_p90_mean,
+        cv_ndvi = NDVI_p90_stdDev / NDVI_p90_mean
+    )
 ```
+
+#### Add continents and biomes
+```{r}
+pacman::p_load(sf, rnaturalearth, rnaturalearthdata)
+
+# Convert coords to sf object
+coords <- st_as_sf(coords, coords = c("X", "Y"))
+
+st_crs(coords) <- 4326
+
+# Load continent and biome data
+continents <- ne_countries(scale = "medium", returnclass = "sf")[, c("continent", "geometry")]
+biomes <- st_read("wwf_ecoregions/wwf_terr_ecos.shp")[, c("REALM", "geometry")] %>%
+rename(realm = REALM) %>%
+st_make_valid()
+
+# Add continents to coords
+coords <- st_join(coords, continents, join = st_intersects)
+
+# Add biomes to coords
+coords <- st_join(coords, biomes, join = st_intersects)
+
+# Add coordinates as X and Y columns and remove geometry
+coords <- coords %>%
+  mutate(X = st_coordinates(.)[, 1], Y = st_coordinates(.)[, 2]) %>%
+  st_drop_geometry()
+```
+
+
+#### Latitude and longitude to cartesian coordinates
+
+```{r}
+pacman::p_load(GeoThinneR)
+
+# Apply lat-long transformation into cartesian coordinates
+geo2cartesian <- function(data, lat, lon) {
+    xyz <- lon_lat_to_cartesian(lat = data[[lat]], lon = data[[lon]])
+    data[[lon]] <- xyz[, 1] # First column is x
+    data[[lat]] <- xyz[, 2] # Second column is y
+    data$Z <- xyz[, 3] # Third column is z
+    return(data)
+}
+
+coords <- geo2cartesian(coords, lat = "Y", lon = "X")
+```
+
 
 ### Merge all datasets
 
 ```{r}
 # Perform joins and handle missing values
 data <- data %>%
-  left_join(climate, by = "WDPAID") %>%
-  left_join(elevation, by = "WDPAID") %>%
-  left_join(ndvi, by = "WDPAID") %>%
-  drop_na()
- # Use drop_na() to remove rows with missing values
+    left_join(climate, by = "WDPAID") %>%
+    left_join(elevation, by = "WDPAID") %>%
+    left_join(ndvi, by = "WDPAID") %>%
+    left_join(coords, by = "WDPAID") %>%
+    drop_na() %>%
+    slice_sample(n = 5000)
+
+saveRDS(data, "/tmp/wdpa.rds")
 ```
 
 ## Step 2: Analysis
 
--   PCA with all attributes of protected areas.
+-   Ordination with all attributes of protected areas.
 
 ```{r}
 # Load required packages
-pacman::p_load(ggplot2, FactoMineR, factoextra, dplyr)
+pacman::p_load(ggplot2, vegan, dplyr)
 
-# Prepare data for PCA
-pca_data <- data %>% na.omit() %>%
-  dplyr::select(-matches("WDPAID|^intersecting|^bucket|histogram_numeric|stdDev$|^EVI|^NDVI|cv_evi|cv_ndvi")) %>%
-  filter(area > 10)
+# Re-import dataset
+data <- readRDS("/tmp/wdpa.rds") %>%
+    na.omit() %>%
+    dplyr::select(area, elongationratio, normcircularity, numpolygons, numholes, compactnessratio, fractaldimension, ew_length, ns_length, maxlength) %>%
+    filter(area > 1 & !area == max(area))
+
+
 
 # Perform PCA
-pca_result <- PCA(pca_data, scale.unit = TRUE, graph = FALSE)
+pca <- prcomp(data, scale. = TRUE)
 
-# Visualize PCA results
-fviz_pca_biplot(pca_result, 
-                repel = TRUE, 
-                col.var = "blue", 
-                col.ind = "gray",
-                title = "PCA Biplot of Geometric Attributes")
+# Extract PCA scores
+pca_scores <- as.data.frame(pca$x)
+
+# Extract variable loadings
+pca_loadings <- as.data.frame(pca$rotation)
+
+# Calculate variance explained
+variance_explained <- round((pca$sdev^2 / sum(pca$sdev^2)) * 100, 1)
+variance_labels <- paste0("PC", 1:2, " (", variance_explained[1:2], "%)")
+
+# Plot PCA results with variance explained and variable loadings
+pca_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2)) +
+    geom_point(alpha = 0.7, color = "cyan") +
+    stat_density_2d(aes(fill = ..level..), geom = "polygon", alpha = 0.4, bins = 50) +
+    scale_fill_viridis_c() +
+    geom_segment(
+        data = pca_loadings, aes(x = 0, y = 0, xend = PC1 * 5, yend = PC2 * 5),
+        arrow = arrow(length = unit(0.2, "cm")), color = "gray50"
+    ) +
+    ggrepel::geom_text_repel(
+        data = pca_loadings, aes(x = PC1 * 5, y = PC2 * 5, label = rownames(pca_loadings)),
+        color = "black", max.overlaps = Inf
+    ) +
+    labs(
+        title = "PCA Plot",
+        x = variance_labels[1], y = variance_labels[2]
+    ) +
+    ggpubr::theme_pubr() +
+    scale_color_viridis_d(option = "D", begin = 0.2, end = 0.8) +
+    theme(legend.position = "right", legend.direction = "vertical")
 ```
 
 -   **H1**: Test the relationship between elongation and CV-EVI (and CV-NDVI) while controlling for area.
@@ -826,45 +930,332 @@ fviz_pca_biplot(pca_result,
 -   **H3**: \[Details to be added\].
 -   **H4**: \[Details to be added\].
 
+### Random forest
+
+# Libraries
+
+```{r}
+pacman::p_load(tidymodels, tidyverse, future, doRNG, GGally, tictoc, pdp, foreach, doParallel, ranger, caret, GGally, ggcorrplot, corrr)
+```
+
+## Data
+
+## Model settings
+
+```{r}
+# Re-import dataset
+data <- readRDS("/tmp/wdpa.rds") %>%
+    na.omit() %>%
+    dplyr::select(-matches("WDPAID|^intersecting|^bucket|histogram_numeric|stdDev$")) %>%
+    filter(ns_length >= 1, ew_length >= 1) %>%
+    mutate(ns_elongation = ns_length / ew_length)
+
+predictors <- c("area", "elongationratio", "normcircularity", "numpolygons", "numholes", "fractaldimension", "ns_elongation", "maxlength", "continent", "realm", "X", "Y", "Z")
+
+responses <- c("EVI_p90_mean", "NDVI_p90_mean", "cv_evi", "cv_ndvi", "n_climates", "shannon", "simpson", "evenness")
+
+split_prop <- 3 / 4
+ml_engine <- "ranger"
+ml_mode <- "regression"
+ml_importance <- "impurity"
+ml_metrics <- metric_set(rmse, rsq, mae)
+```
+
+## Tuning parameters:
+
+```{r}
+tuning_params <- expand.grid(
+    mtry = seq(2, length(predictors), by = 3), # number predictors
+    trees = seq(100, 1000, by = 100), # Number of trees
+    min_n = c(2, 5) # Minimum number of samples required to split an
+)
+
+nrow(tuning_params)
+```
+
+## Data preparation
+
+```{r}
+#| eval: true
+ml_data <- select(data, any_of(c(responses, predictors)))
+
+# Correlation between predictors and responses
+predictor_response_corr <- ml_data %>%
+    select(all_of(c(predictors, responses))) %>%
+    select(where(is.numeric)) %>% # Ensure only numeric columns are selected
+    cor() %>%
+    as.data.frame() %>%
+    rownames_to_column(var = "Variable") %>%
+    filter(Variable %in% predictors) %>%
+    pivot_longer(-Variable, names_to = "Response", values_to = "Correlation") %>%
+    arrange(desc(abs(Correlation))) %>%
+    mutate(
+        Response = factor(Response, levels = unique(Response)),
+        Variable = factor(Variable, levels = unique(Variable))
+    )
+
+ggplot(predictor_response_corr, aes(x = Response, y = Variable, fill = Correlation)) +
+    geom_tile() +
+    geom_text(
+        aes(label = ifelse(abs(Correlation) >= 0.5, round(Correlation, 2), "")),
+        color = "black", size = 3
+    ) +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+    theme_minimal() +
+    theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(angle = 45, vjust = 1)
+    ) +
+    labs(
+        title = "Correlation Between Predictors and Responses",
+        x = "",
+        y = ""
+    ) +
+    coord_flip()
+```
+
+## Preparing training and testing data
+
+```{r}
+set.seed(9872345)
+ml_split <- initial_split(ml_data, prop = split_prop)
+
+ml_split
+```
+
+## Create a cross-validation set for later use
+
+```{r}
+ml_cv <- vfold_cv(training(ml_split))
+```
+
+## Create recipe
+
+```{r}
+# https://recipes.tidymodels.org/articles/Ordering.html
+
+ml_recipes <- lapply(responses, function(y) {
+    formula <- as.formula(paste(y, paste(predictors, collapse = "+"), sep = "~"))
+    ml_recipe <- recipe(formula, data = ml_data) %>%
+        # Pre-processing steps
+        ## Transform numeric predictors
+        # step_YeoJohnson(all_numeric()) %>%
+        # Handle unseen levels in categorical variables
+        step_novel(all_nominal()) %>%
+        ## Recode categorical variables
+        step_dummy(all_nominal()) %>%
+        ## Standardize all numeric columns
+        # step_normalize(all_numeric()) %>%
+        # Remove NAs
+        step_naomit()
+})
+```
+
+# Create the model
+
+```{r}
+ml_model <-
+  # specify that the model is a random forest
+  rand_forest() %>%
+  # Parameters to be tuned
+  set_args(
+    mtry = tune(),
+    trees = tune(),
+    min_n = tune()
+  ) %>%
+  # Select the modeling engine
+  set_engine(engine = ml_engine, importance = "impurity") %>%
+  # Select between regression and binary classification
+  set_mode(ml_mode)
+```
+
+## Create a workflow
+
+```{r}
+ml_workflows <- lapply(ml_recipes, function(recipe) {
+    ml_workflow <- workflow() %>%
+        # add the recipe
+        add_recipe(recipe) %>%
+        # add the model
+        add_model(ml_model)
+})
+```
+
+## Tune parameters
+
+```{r}
+ntuning <- nrow(tuning_params)
+nlimit <- 100
+plan("future::multisession",
+    workers = ifelse(ntuning < nlimit, ntuning, nlimit)
+)
+
+tic()
+# extract results
+ml_tune_results <- lapply(ml_workflows, function(workflow) {
+    workflow %>%
+        tune_grid(
+            resamples = ml_cv, # Cross-validation data object
+            # Grid of hyperparameters
+            grid = tuning_params,
+            # Metrics to evaluate
+            metrics = ml_metrics
+        )
+})
+toc()
+
+saveRDS(ml_tune_results, "rds_backups/ml_tune_results.rds")
+```
+
+## Plot tunned parameters
+
+```{r}
+# Generate and display plots for each element in ml_tune_results
+lapply(ml_tune_results, function(x) {
+    autoplot(x) + ggtitle("Tuning Results")
+})
+```
+
+![](rftune.png)
+
+## Collect and evaluate results
+
+```{r}
+ml_tune_results <- readRDS("rds_backups/ml_tune_results.rds")
+
+ml_tune_results <- lapply(ml_tune_results, function(x) {
+    select_best(x, metric = "rmse")
+})
+
+print(ml_tune_results)
+```
+
+## Finalize workflow
+
+```{r}
+for (x in 1:length(ml_workflows)) {
+ml_workflows[[x]] <- finalize_workflow(ml_workflows[[x]], 
+ml_tune_results[[x]])
+}
+
+```
+
+# Fit the final model to the training and testing data
+
+```{r}
+ml_fits <- lapply(ml_workflows, function(workflow) {
+    workflow %>%
+    # fit on the training set and evaluate on test set
+    last_fit(ml_split)
+})
+```
+
+check results
+
+```{r}
+test_performance <- lapply(ml_fits, function(ml_fit) {ml_fit %>% collect_metrics()})
+
+names(test_performance) <- responses
+
+test_performance
+
+# rmse 0.5809
+# rsq 0.5920
+```
+
+### Variable importance plots
+```{r}
+pacman::p_load(vip)
+
+names(ml_fits) <- responses
+
+plot_varimportance <- function(model, fileid = NULL, num_features = 15, geom = "col"){
+f_model <- extract_fit_parsnip(model)
+
+# Plot variable importance
+importance_scores <- vip(f_model$fit, num_features = num_features, geom = geom)
+importance_scores
+
+# Define a custom color scale with blue shades
+blue_shades <- colorRampPalette(c("lightblue", "darkblue"))(num_features)
+
+# Plot with custom blue shades
+ggplot(importance_scores$data, aes(x = reorder(Variable, Importance), y = Importance, fill = Importance)) +
+    geom_col() +
+    scale_fill_gradient(low = "lightblue", high = "darkblue") +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = "Variable Importance Plot", x = "Variables", y = "Importance")
+
+ggsave(str_glue("figures/{fileid}_variable_importance_plot.png"),
+    width = 15, height = 10, units = "cm", bg = "white"
+)
+}
+
+# Loop over the models
+sapply(names(ml_fits), USE.NAMES = T, simplify = F, function(x){
+    plot_varimportance(ml_fits[[x]], fileid = x)
+})
+```
+
+#### Partial dependence plots
+
+```{r}
+pacman::p_load(hstats)
+
+names(ml_fits) <- responses
+
+plot_partial_dependence <- function(model, feature, fileid = NULL, background_data = NULL) {
+  f_model <- extract_fit_parsnip(model)
+  
+  # Generate partial dependence data
+  pd_data <- hstats::partial_dep(f_model$fit, feature, X = background_data %>% select(all_of(predictors)))
+  
+  # Plot partial dependence
+  pd_plot <- ggplot(pd_data, aes_string(x = feature, y = "partial_dependence")) +
+    geom_line(color = "blue") +
+    theme_minimal() +
+    labs(
+      title = paste("Partial Dependence Plot for", feature),
+      x = feature,
+      y = "Partial Dependence"
+    )
+  
+  # Save the plot
+  if (!is.null(fileid)) {
+    ggsave(str_glue("figures/{fileid}_partial_dependence_{feature}.png"),
+           plot = pd_plot, width = 15, height = 10, units = "cm", bg = "white"
+    )
+  }
+  
+  return(pd_plot)
+}
+
+# Loop over the models and features
+sapply(names(ml_fits), USE.NAMES = T, simplify = F, function(response) {
+  features <- predictors  # Use predictors as features for partial dependence
+  lapply(features, function(feature) {
+    plot_partial_dependence(ml_fits[[response]], feature = "normcircularity", fileid = response, background_data = ml_data)
+  })
+})
+```
+
+
+
 ## Interpreting most important variables from random forest
 
 -   Identify the threshold for North-South extent and CV-EVI.
 
-```{r}
-# Load required package
-pacman::p_load(segmented)
 
-# Fit linear model
-lm_model <- lm(cv_evi ~ ns_length, data = data)
-
-# Apply segmented regression
-segmented_model <- segmented(lm_model, seg.Z = ~ns_length)
-
-# Extract breakpoints
-breakpoints <- segmented_model$psi[, "Est."]
-print(breakpoints)
-
-# Get fitted values
-fitted_values <- fitted(segmented_model)
-```
 
 # Results
 
 ## Figure 1
 
-PCA figure goes here.
+Ordination figure goes here.
 
 ```{r}
-# Create density surface plot with variable importance arrows
-ggplot(pca_scores, aes(x = PC1, y = PC2)) +
-    stat_density_2d(aes(fill = ..level..), geom = "polygon", color = NA, alpha = 0.7) +  # Density surface
-    scale_fill_viridis_c() +
-    geom_segment(data = pca_loadings, aes(x = 0, y = 0, xend = PC1 * 5, yend = PC2 * 5),
-                 arrow = arrow(length = unit(0.2, "cm")), color = "red") +
-    geom_text(data = pca_loadings, aes(x = PC1 * 5, y = PC2 * 5, label = rownames(pca_loadings)),
-              hjust = 1.2, vjust = 1.2, color = "red") +
-    labs(x = "Principal Component 1", y = "Principal Component 2") +
-    ggpubr::theme_pubr()
+nmds_plot
 ```
 
 ## Figure XX
@@ -877,10 +1268,11 @@ library(ggplot2)
 plot_data <- data.frame(ns_length = data$ns_length, cv_evi = data$cv_evi, Fitted = fitted_values)
 
 ggplot(plot_data, aes(x = ns_length, y = cv_evi)) +
-    geom_point() + 
-    geom_line(aes(y = Fitted), color = "blue") + 
-    geom_vline(xintercept = breakpoints, linetype = "dashed", color = "red") + 
-    labs(title = "Segmented Regression", x = "North-South Length", y = "CV-EVI") + 
+    geom_point() +
+    geom_line(aes(y = Fitted), color = "blue") +
+    geom_vline(xintercept = breakpoints, linetype = "dashed", color = "red") +
+    labs(title = "Segmented Regression", x = "North-South Length", y = "CV-EVI") +
+    scale_x_log10() +
     ggpubr::theme_pubr()
 ```
 
