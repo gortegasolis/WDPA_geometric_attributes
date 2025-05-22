@@ -1,11 +1,12 @@
 ---
-title: "Protected Areas Geometric Attributes and Biodiversity"
+title: "Relationship between geometric attributes of protected areas, habitat heterogeneity and biodiversity"
 author: 
   - name: Gabriel Ortega
   - name: Petr Keil
   - name: Michela Perrone
   - name: Daniela Mellado
   - name: Manuele Bazzichetto
+  - name: Carmen Soria
 abstract: |
   Protected areas (PAs) design emphasizes shapes closer to a circle to reduce border effects. Kunin (1997) shows that plots with elongated shapes have more biodiversity. Kunin's findings are based on the principle that closer things are more similar, so elongated plots (ergo elongated PAs) should include things that are more distant between them, which are more likely to be different. While we cannot record species richness (or another diversity metric) worldwide simultaneously and with spatial accuracy, metrics derived from Earth Observation have been proposed as alternative proxies for biodiversity monitoring. The Spectral Variation Hypothesis proposes that geographic areas with high heterogeneity in remote images present high environmental heterogeneity, and therefore, support more biodiversity. 
 format: 
@@ -34,13 +35,11 @@ execute:
 
 # Hypotheses
 
-1.  **Heterogeneity increases with area**: Larger protected areas encompass a broader range of habitats by including more distant locations, thereby increasing habitat heterogeneity due to the principle of distance decay of similarity.
-2.  **Elongated PAs have more habitat heterogeneity**: Given constant area, elongated PAs cover longer environmental gradients than round PAs, increasing habitat heterogeneity due to the distance decay of similarity.
-3.  **Fragmented PAs harbor more heterogeneity**: Given constant area, fragmented PAs (measured as the number of polygons) are expected to have higher heterogeneity (Fahrig, Chase).
-4.  **Shape complexity increases heterogeneity**: Given constant area, PAs with higher shape complexity (measured as an area-to-perimeter ratio) are expected to have more heterogeneity.
+1.  **Heterogeneity increases with area**: Larger protected areas encompass a broader range of habitats by including more distant locations, thereby increasing their habitat heterogeneity due to the principle of distance decay of similarity.
+2.  **Elongated PAs have more habitat heterogeneity**: Given constant area, elongated PAs cover longer environmental gradients than round PAs, increasing habitat heterogeneity.
+3.  **Fragmented PAs harbor more heterogeneity**: Given constant area, fragmented PAs (measured as the number of polygons) are expected to have higher heterogeneity.
+4.  **Shape complexity increases heterogeneity**: Given constant area, PAs with higher shape complexity are expected to have more heterogeneity.
 5.  **North-South extent increases heterogeneity**: Habitat heterogeneity increases with increasing North-South extent, as PAs capture the global latitudinal gradient of temperature and precipitation. This effect is detectable above a threshold value of extent.
-6.  **Wide elevational range**: Wider elevational ranges cover a higher variability in environmental conditions, increasing habitat heterogeneity.
-7.  **Bioclimatic zonation**: Bigger areas include more diverse climates and thus more habitat heterogeneity.
 
 We expect some of these metrics/hypotheses to be correlated with each other, and it may not be possible to separate their effects due to fundamental dependencies (Sizling et al. 2024).
 
@@ -48,640 +47,7 @@ We expect some of these metrics/hypotheses to be correlated with each other, and
 
 ## Step 1: Protected areas dataset
 
-We used the December 2024 version of the World Database of Protected Areas. We restricted the analyses to terrestrial protected areas with area higher than zero and whose status is one of the following: "Designated", "Inscribed", "Adopted" or "Established". Each PA is identified with a WDPAID assigned by the UN Environment Programme World Conservation Monitoring Centre. However, protected areas could receive multiple administrative designations according to different institutions, resulting in multiple WDPAID for overlapping areas. For instance, part of a national park could be also a natural monument and be listed twice in the database. To avoid problems with overlapping areas we dissolved PAs sharing the same WDPAID and then identified all of the intersecting areas.
-
-```{sql}
--- 1. Create initial geometry aggregation with spatial index
-CREATE MATERIALIZED VIEW admin.terrestrial_geometry_1 AS
-SELECT
-    wdpaid,
-    ST_UNION(geometry) AS geometry
-FROM public.wdpa_poly_dec2024
-WHERE marine = '0'
-  AND gis_area > 0
-  AND status IN ('Designated', 'Inscribed', 'Adopted', 'Established')
-GROUP BY wdpaid;
-```
-
-Add spatial index to speed up further processing.
-
-```{sql}
-CREATE INDEX tg1_geometry_idx ON admin.terrestrial_geometry_1 USING GIST(geometry);
-```
-
-Add an additional index on the unique identifier.
-
-```{sql}
-CREATE INDEX tg1_wdpaid_idx ON admin.terrestrial_geometry_1 (wdpaid);
-```
-
-Since some areas overlap, we created an additional table to identify the set of intersecting WDPAIDs per polygon.
-
-```{sql}
--- 2. Create intersection analysis with optimized joins
-CREATE MATERIALIZED VIEW admin.terrestrial_intersections_2 AS
-SELECT
-    a.wdpaid,
-    ARRAY_AGG(DISTINCT b.wdpaid) AS intersecting_ids
-FROM admin.terrestrial_geometry_1 a
-JOIN admin.terrestrial_geometry_1 b 
-  ON a.wdpaid <> b.wdpaid
-  AND ST_INTERSECTS(a.geometry, b.geometry)
-GROUP BY a.wdpaid;
-```
-
-Add a spatial index to the new table.
-
-```{sql}
-CREATE INDEX ti2_wdpaid_idx ON admin.terrestrial_intersections_2 (wdpaid);
-```
-
-We create a combined view of the two previous tables.
-
-```{sql}
--- 3. Create final combined view
-CREATE OR REPLACE VIEW admin.wdpaid_terrestrial_union AS
-SELECT
-    g.wdpaid,
-    g.geometry,
-    COALESCE(i.intersecting_ids, ARRAY[]::bigint[]) AS intersecting_ids
-FROM admin.terrestrial_geometry_1 g
-LEFT JOIN admin.terrestrial_intersections_2 i
-  ON g.wdpaid = i.wdpaid;
-```
-
-With the previous view in place we can create a materialized view to pull data from it.
-
-```{sql}
--- 4. Create public-facing materialized view
-CREATE MATERIALIZED VIEW public.wdpaid_terrestrial_union AS
-SELECT * FROM admin.wdpaid_terrestrial_union;
-```
-
-Add a spatial index to the materialized view.
-
-```{sql}
--- Add final indexes
-CREATE INDEX wtu_geometry_idx ON public.wdpaid_terrestrial_union USING GIST(geometry);
-```
-
-Add an index to the unique identifier in the materialized view.
-
-```{sql}
-CREATE INDEX wtu_wdpaid_idx ON public.wdpaid_terrestrial_union (wdpaid);
-```
-
-## Step 2: Characterization of Geometrical Dimensions
-
-We first characterized the fundamental geometrical dimensions (axes) of the PAs. This step is essential to address potential collinearities among geometrical characteristics. For instance, elongated areas may be large, round areas may be small, and fragmented areas may have low area-perimeter ratios.
-
-```{sql}
--- 1. Geometry metrics view and materialized view
-CREATE OR REPLACE VIEW admin.matview_geometric_metrics
- AS
- SELECT data.wdpaid,
-    st_area(data.geometry::geography) / 1000000.0::double precision AS area_km2,
-        CASE
-            WHEN mbr.short > 0::double precision THEN mbr.long / mbr.short
-            ELSE 0::double precision
-        END AS elongationratio,
-    4.0::double precision * pi() * (st_area(data.geometry::geography) / 1000000.0::double precision) / NULLIF(power(st_perimeter(data.geometry::geography) / 1000.0::double precision, 2::double precision), 0::double precision) AS normcircularity,
-    st_numgeometries(data.geometry) AS numpolygons,
-    st_nrings(data.geometry) - st_numgeometries(data.geometry) AS numholes,
-        CASE
-            WHEN mbr.hull_area > 0::double precision THEN st_area(data.geometry::geography) / 1000000.0::double precision / mbr.hull_area
-            ELSE 0::double precision
-        END AS compactnessratio,
-        CASE
-            WHEN (st_perimeter(data.geometry::geography) / 1000.0::double precision) > 0::double precision AND (st_area(data.geometry::geography) / 1000000.0::double precision) > 0::double precision THEN 2.0::double precision * ln(st_perimeter(data.geometry::geography) / 1000.0::double precision) / ln(st_area(data.geometry::geography) / 1000000.0::double precision)
-            ELSE NULL::double precision
-        END AS fractaldimension
-   FROM wdpaid_terrestrial_union data
-     LEFT JOIN LATERAL ( SELECT st_area(st_convexhull(data.geometry)::geography) / 1000000.0::double precision AS hull_area,
-            st_distance(p1.p1::geography, p2.p2::geography) / 1000.0::double precision AS long,
-            st_distance(p2.p2::geography, p3.p3::geography) / 1000.0::double precision AS short
-           FROM st_orientedenvelope(data.geometry) oe(oe),
-            LATERAL st_pointn(st_exteriorring(oe.oe), 1) p1(p1),
-            LATERAL st_pointn(st_exteriorring(oe.oe), 2) p2(p2),
-            LATERAL st_pointn(st_exteriorring(oe.oe), 3) p3(p3)) mbr ON true;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS public.mv_geometric_metrics
- SELECT * FROM admin.matview_geometric_metrics;
-
-----------------------------------------------------------------------------------------------------------
--- 2. Extension metrics view and materialized view
-CREATE OR REPLACE VIEW admin.matview_spatial_extension
- AS
- SELECT wdpaid_terrestrial_union.wdpaid,
-    st_distance(st_makepoint(st_xmin(box.box::box3d), (st_ymin(box.box::box3d) + st_ymax(box.box::box3d)) / 2::double precision)::geography, st_makepoint(st_xmax(box.box::box3d), (st_ymin(box.box::box3d) + st_ymax(box.box::box3d)) / 2::double precision)::geography) / 1000::double precision AS ew_length,
-    st_distance(st_makepoint((st_xmin(box.box::box3d) + st_xmax(box.box::box3d)) / 2::double precision, st_ymin(box.box::box3d))::geography, st_makepoint((st_xmin(box.box::box3d) + st_xmax(box.box::box3d)) / 2::double precision, st_ymax(box.box::box3d))::geography) / 1000::double precision AS ns_length,
-    (( SELECT max(st_distance(a.geom::geography, b.geom::geography)) AS max
-           FROM st_dumppoints(st_convexhull(wdpaid_terrestrial_union.geometry)) a(path, geom),
-            st_dumppoints(st_convexhull(wdpaid_terrestrial_union.geometry)) b(path, geom))) / 1000::double precision AS maxlength_km
-   FROM wdpaid_terrestrial_union
-     CROSS JOIN LATERAL st_envelope(wdpaid_terrestrial_union.geometry) box(box);
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS public.mv_extension_metrics
- SELECT * FROM admin.matview_spatial_extension; 
-
------------------------------------------------------------------------------------------------------------
--- 3. Combined view
-CREATE OR REPLACE VIEW public."MOBI_WDPA_land_combined_metrics"
- AS
- SELECT base.wdpaid,
-    base.intersecting_ids,
-    geom.area_km2 AS area,
-    geom.elongationratio,
-    geom.normcircularity,
-    geom.numpolygons,
-    geom.numholes,
-    geom.compactnessratio,
-    geom.fractaldimension,
-    ext.ew_length,
-    ext.ns_length,
-    ext.maxlength_km AS maxlength
-   FROM wdpaid_terrestrial_union base
-     JOIN mv_geometric_metrics geom USING (wdpaid)
-     JOIN mv_extension_metrics ext USING (wdpaid);
-```
-
-We extracted elevation data from Copernicus WorldEM-30.
-
-```{javascript}
-// Author: Gabriel Ortega
-
-// This script is organized in four sections:
-// 1. SETTINGS: Contains information about the input data and some pre-processing steps.
-// 2. FUNCTION(S): Main function(s) to apply.
-// 3. EXECUTION: Apply the function(s) to the input data.
-// 4. EXPORT RESULTS: Export outside of EarthEngine.
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// 1. SETTINGS
-
-// Polygons collection
-var pols = ee.FeatureCollection("WCMC/WDPA/current/polygons"); // Explicitly define WDPA polygons
-// Unique polygons identifier
-var uniqueID = 'WDPAID';
-
-// Elevation Dataset
-var elevationDataset = ee.ImageCollection("COPERNICUS/DEM/GLO30"); // Use the Copernicus DEM GLO 30m
-var elevationBand = 'DEM'; // Band name for elevation is 'DEM'
-var waterMaskBand = 'WBM'; // Band name for water mask is 'WBM'
-
-// Create a bounding box if necessary
-
-// Original bounding box coordinates
-var xmin = -180;    // left
-var ymin = 90;   // top
-var xmax = 180;  // right
-var ymax = -90;    // bottom
-
-// Define which box you want
-// Select box (0 = full, 1-16 = subdivisions)
-var whichBox = 16;  // Change this value
-
-// Initialize bbox variable
-var bbox;
-
-if (whichBox === 0) {
-  // Full bounding box
-  bbox = ee.Geometry.BBox(xmin, ymin, xmax, ymax);
-} else {
-  // Grid configuration (4x4)
-  var xSegments = 4;
-  var ySegments = 4;
-  
-  // Calculate step sizes
-  var xStep = (xmax - xmin)/xSegments;  // 45° per column
-  var yStep = (ymax - ymin)/ySegments;  // -22.5° per row
-  
-  // Convert whichBox (1-16) to grid indices
-  var adjustedIndex = whichBox - 1;
-  var row = Math.floor(adjustedIndex / xSegments);  // 0-3 (bottom to top)
-  var col = adjustedIndex % xSegments;              // 0-3 (left to right)
-  
-  // Reverse row order (original grid is top to bottom)
-  var yIndex = (ySegments - 1) - row;
-  
-  // Calculate coordinates
-  var xStart = xmin + col * xStep;
-  var xEnd = xStart + xStep;
-  var yStart = ymin + yIndex * yStep;
-  var yEnd = yStart + yStep;
-  
-  bbox = ee.Geometry.BBox(xStart, yStart, xEnd, yEnd);
-}
-
-
-// Name of output file
-var fileName = 'elevation_stats_WDPA_'+xmin+'_'+ymin+'_'+xmax+'_'+ymax+'_bbox'+whichBox;
-
-// Filter polygons dataset as required
-var filteredPols = pols
-  .filterBounds(bbox)
-  .filter(
-    ee.Filter.and(
-      ee.Filter.notNull([uniqueID]),
-      ee.Filter.eq('MARINE', '0'),
-      ee.Filter.gt('GIS_AREA', 0),  // Added gis_area > 0 filter
-      ee.Filter.inList('STATUS', [  // Added status filter
-        'Designated',
-        'Inscribed',
-        'Adopted',
-        'Established'
-      ])
-    )
-  );
-
-
-// Group polygons by WDPA_PID and combine their geometries.
-var uniquePolID = filteredPols.aggregate_array(uniqueID).distinct().map(function(id) {
-  var collection = filteredPols.filter(ee.Filter.eq(uniqueID, id));
-  // Combine geometries using a unary union (merging all geometries in the collection).
-  var combinedGeometry = collection.geometry().dissolve(); // Use dissolve to combine all geometries
-  return ee.Feature(combinedGeometry, {WDPAID: id});
-});
-
-// Convert to FeatureCollection
-var uniquePolygons = ee.FeatureCollection(uniquePolID);
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// 2. FUNCTION(S)
-
-var processElevation = function() {
-
-  var features = uniquePolygons.map(function(feature) {
-    var combinedGeometry = feature.geometry();
-
-    // Get the elevation and water mask bands.  Since elevationDataset is a collection, we need to mosaic it.
-    var elevation = elevationDataset.select(elevationBand).mosaic();
-    var waterMask = elevationDataset.select(waterMaskBand).mosaic();
-
-    // Apply the water mask:
-    // WBM values: 0=No water, 1=Ocean, 2=Lake, 3=River.
-    // We want to include land, which is WBM == 0.
-    var maskedElevation = elevation.updateMask(waterMask.eq(0)); // Keep only where WBM == 0
-
-    // Calculate elevation statistics.
-    var stats = maskedElevation.reduceRegion({
-      reducer: ee.Reducer.min()
-        .combine(ee.Reducer.max(), null, true)
-        .combine(ee.Reducer.mean(), null, true)
-        .combine(ee.Reducer.stdDev(), null, true),
-      geometry: combinedGeometry,
-      scale: 30,
-      maxPixels: 1e13,
-      bestEffort: true
-    });
-
-    var renamedStats = {
-        elevation_min: stats.get('DEM_min'),
-        elevation_max: stats.get('DEM_max'),
-        elevation_mean: stats.get('DEM_mean'),
-        elevation_stdDev: stats.get('DEM_stdDev'),
-    };
-    return ee.Feature(null, renamedStats).set(uniqueID, feature.get(uniqueID));
-  });
-
-  return ee.FeatureCollection(features);
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// 3. EXECUTION
-
-var allFeatures = processElevation();
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// 4. EXPORT RESULTS
-
-Export.table.toDrive({
-  collection: allFeatures,
-  description: fileName,
-  fileFormat: 'CSV',
-  folder: 'Earthengine_exports'
-});
-```
-
-We extracted climate data from ...
-
-```{javascript}
-// Authors: Gabriel Ortega
-
-// This script is organized in four sections:
-// 1. SETTINGS: Contains information about the input data and some pre-processing steps.
-// 2. FUNCTION(S): Main function(s) to apply.
-// 3. EXECUTION: Apply the function(s) to the input data.
-// 4. EXPORT RESULTS: Export outside of EarthEngine.
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// 1. SETTINGS
-
-// Polygons collection
-var pols = ee.FeatureCollection("WCMC/WDPA/current/polygons"); // Explicitly define WDPA polygons
-// Unique polygons identifier
-var uniqueID = 'WDPAID';
-// Climate Dataset
-var climateDataset = ee.Image('projects/gortega-research/assets/koppen_geiger_0p01'); // Koppen-Geiger climate zones
-var climateBand = 'b1'; // Band name for climate classification
-
-// Create a bounding box if necessary
-
-// Original bounding box coordinates
-var xmin = -180;    // left
-var ymin = 90;   // top
-var xmax = 180;  // right
-var ymax = -90;    // bottom
-
-// Define which box you want
-// Select box (0 = full, 1-16 = subdivisions)
-var whichBox = 16;  // Change this value
-
-// Initialize bbox variable
-var bbox;
-
-if (whichBox === 0) {
-  // Full bounding box
-  bbox = ee.Geometry.BBox(xmin, ymin, xmax, ymax);
-} else {
-  // Grid configuration (4x4)
-  var xSegments = 4;
-  var ySegments = 4;
-  
-  // Calculate step sizes
-  var xStep = (xmax - xmin)/xSegments;  // 45° per column
-  var yStep = (ymax - ymin)/ySegments;  // -22.5° per row
-  
-  // Convert whichBox (1-16) to grid indices
-  var adjustedIndex = whichBox - 1;
-  var row = Math.floor(adjustedIndex / xSegments);  // 0-3 (bottom to top)
-  var col = adjustedIndex % xSegments;              // 0-3 (left to right)
-  
-  // Reverse row order (original grid is top to bottom)
-  var yIndex = (ySegments - 1) - row;
-  
-  // Calculate coordinates
-  var xStart = xmin + col * xStep;
-  var xEnd = xStart + xStep;
-  var yStart = ymin + yIndex * yStep;
-  var yEnd = yStart + yStep;
-  
-  bbox = ee.Geometry.BBox(xStart, yStart, xEnd, yEnd);
-}
-
-
-// Name of output file
-var fileName = 'climate_analysis_WDPA_'+xmin+'_'+ymin+'_'+xmax+'_'+ymax+'_bbox'+whichBox;
-
-// Filter polygons dataset as required
-var filteredPols = pols
-  .filterBounds(bbox)
-  .filter(
-    ee.Filter.and(
-      ee.Filter.notNull([uniqueID]),
-      ee.Filter.eq('MARINE', '0'),  // Keep only land areas
-      ee.Filter.gt('GIS_AREA', 0),  // Keep gis_area > 0 filter
-      ee.Filter.inList('STATUS', [  // Keep status in list
-        'Designated',
-        'Inscribed',
-        'Adopted',
-        'Established'
-      ])
-    )
-  );
-
-
-// Group polygons by WDPAID and combine their geometries.
-var groupedPolygons = filteredPols.aggregate_array(uniqueID).distinct().map(function(id) {
-  var collection = filteredPols.filter(ee.Filter.eq(uniqueID, id));
-  // Combine geometries using a unary union (merging all geometries in the collection).
-  var combinedGeometry = collection.geometry().dissolve(); // Use dissolve to combine all geometries
-  return ee.Feature(combinedGeometry, {WDPAID: id});
-});
-
-// Convert to FeatureCollection
-var uniquePolygons = ee.FeatureCollection(groupedPolygons);
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// 2. FUNCTION(S)
-var processData = function() {
-
-  var features = uniquePolygons.map(function(feature) {
-    var combinedGeometry = feature.geometry();
-
-    // Get the climate data.
-    var climate = climateDataset.select(climateBand);
-
-    // Use a histogram to get the pixel counts for each climate category within the combined polygon.
-    var climateStats = climate.reduceRegion({
-        reducer: ee.Reducer.histogram(),
-        geometry: combinedGeometry,
-        scale: 100,
-        maxPixels: 1e13
-    });
-
-    // Get the total number of pixels in the combined polygon.
-    var totalPixels = climate.reduceRegion({
-        reducer: ee.Reducer.count(),
-        geometry: combinedGeometry,
-        scale: 100,
-        maxPixels: 1e13
-    }).get(climateBand);
-
-    var results = {
-        climate_histogram: climateStats.get(climateBand),
-        total_pixels: totalPixels
-    };
-
-    return ee.Feature(null, results).set(uniqueID, feature.get(uniqueID));
-  });
-
-  return ee.FeatureCollection(features);
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// 3. EXECUTION
-
-var allFeatures = processData();
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// 4. EXPORT RESULTS
-Export.table.toDrive({
-  collection: allFeatures,
-  description: fileName,
-  fileFormat: 'CSV',
-  folder: 'Earthengine_exports'
-});
-```
-
-Finally we extracted NDVI data from
-
-```{javascript}
-// Authors: Gabriel Ortega & Michela Perrone
-
-// This script is organized in four sections:
-// 1. SETTINGS: Contains information about the input data and some pre-processing steps.
-// 2. FUNCTION(S): Main function(s) to apply.
-// 3. EXECUTION: Apply the function(s) to the input data.
-// 4. EXPORT RESULTS: Export outside of EarthEngine.
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// 1. SETTINGS
-
-// Rasters collection
-var collection = 'MODIS/061/MOD13Q1';
-
-// Polygons collection
-var pols = ee.FeatureCollection('WCMC/WDPA/current/polygons');
-
-// Unique polygons identifier
-var uniqueID = 'WDPAID';
-
-// Set years of interest
-var startYear = 2000;
-var endYear = 2024;
-
-// Select bands of interest
-var bands = ['NDVI', 'EVI'];
-var qualityBand = 'SummaryQA';
-var qualityValue = 0;
-var scaleFactor = 0.0001;
-
-// Create a bounding box if necessary
-
-// Original bounding box coordinates
-var xmin = -180;    // left
-var ymin = 90;   // top
-var xmax = 180;  // right
-var ymax = -90;    // bottom
-
-// Define which box you want
-// Select box (0 = full, 1-16 = subdivisions)
-var whichBox = 16;  // Change this value
-
-// Initialize bbox variable
-var bbox;
-
-if (whichBox === 0) {
-  // Full bounding box
-  bbox = ee.Geometry.BBox(xmin, ymin, xmax, ymax);
-} else {
-  // Grid configuration (4x4)
-  var xSegments = 4;
-  var ySegments = 4;
-  
-  // Calculate step sizes
-  var xStep = (xmax - xmin)/xSegments;  // 45° per column
-  var yStep = (ymax - ymin)/ySegments;  // -22.5° per row
-  
-  // Convert whichBox (1-16) to grid indices
-  var adjustedIndex = whichBox - 1;
-  var row = Math.floor(adjustedIndex / xSegments);  // 0-3 (bottom to top)
-  var col = adjustedIndex % xSegments;              // 0-3 (left to right)
-  
-  // Reverse row order (original grid is top to bottom)
-  var yIndex = (ySegments - 1) - row;
-  
-  // Calculate coordinates
-  var xStart = xmin + col * xStep;
-  var xEnd = xStart + xStep;
-  var yStart = ymin + yIndex * yStep;
-  var yEnd = yStart + yStep;
-  
-  bbox = ee.Geometry.BBox(xStart, yStart, xEnd, yEnd);
-}
-
-
-// Name of output file
-var fileName = 'mean_sd_NDVI_EVI_WDPA_' + xmin + '_' + ymin + '_' + xmax + '_' + ymax + '_' + startYear + '_' + endYear+'_bbox'+whichBox;
-
-// Filter polygons dataset as required
-var filteredPols = pols
-  .filterBounds(bbox)
-  .filter(
-    ee.Filter.and(
-      ee.Filter.notNull([uniqueID]),
-      ee.Filter.eq('MARINE', '0'),
-      ee.Filter.gt('GIS_AREA', 0),  // Added gis_area > 0 filter
-      ee.Filter.inList('STATUS', [  // Added status filter
-        'Designated',
-        'Inscribed',
-        'Adopted',
-        'Established'
-      ])
-    )
-  );
-
-
-// Group polygons by WDPA_PID and combine their geometries.
-var uniquePolID = filteredPols.aggregate_array(uniqueID).distinct().map(function(id) {
-  var collection = filteredPols.filter(ee.Filter.eq(uniqueID, id));
-  // Combine geometries using a unary union (merging all geometries in the collection).
-  var combinedGeometry = collection.geometry().dissolve(); // Use dissolve to combine all geometries
-  return ee.Feature(combinedGeometry, {WDPAID: id});
-});
-
-// Convert to FeatureCollection
-var uniquePolygons = ee.FeatureCollection(uniquePolID);
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// 2. FUNCTION(S)
-
-var processYear = function(year) {
-  var startDate = ee.Date.fromYMD(year, 1, 1); // Indicate a starting date
-  var endDate = ee.Date.fromYMD(ee.Number(year).add(1), 1, 1); // Indicate an ending date
-
-  // 2.1. Image Processing:
-  var processedImage = ee.ImageCollection(collection)
-    .filterDate(startDate, endDate) // Filter start and end dates
-    .select(bands.concat([qualityBand])) // Add the quality band to selection
-    .map(function(image) {
-      var qualityMask = image.select(qualityBand).eq(qualityValue); // Create a quality mask
-      return image.updateMask(qualityMask).select(bands); // Apply the quality mask to each image
-    })
-    .reduce(ee.Reducer.percentile([90])) // Reduce all the overlapped image-pixels to a single one
-    .multiply(scaleFactor); // Apply the corresponding scale factor
-  
-  // 2.2. Feature Generation:
-  var features = uniquePolygons.map(function(feature) {
-    var combinedGeometry = feature.geometry();
-    
-    // 2.3. Get variables of interest:
-    var stats = processedImage.reduceRegion({
-      reducer: ee.Reducer.mean().combine(ee.Reducer.stdDev(), null, true),
-      geometry: combinedGeometry,
-      scale: 250,        // Cell size
-      maxPixels: 1e13,    // Increase if needed for large polygons
-      bestEffort: true
-    });
-
-    // 2.4. Return annual results
-    return ee.Feature(null, stats).set(uniqueID, feature.get(uniqueID)).set('year', year);
-  });
-
-  // 2.5. Return all results
-  return ee.FeatureCollection(features);
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// 3. EXECUTION
-
-var allFeatures = ee.FeatureCollection(
-  ee.List.sequence(startYear, endYear).map(processYear).flatten()
-).flatten();
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// 4. EXPORT RESULTS
-
-Export.table.toDrive({
-  collection: allFeatures,
-  description: fileName,
-  fileFormat: 'CSV',
-  folder: 'Earthengine_exports'
-});
-```
-
-Merge data
+We used the January 2025 version of the World Database of Protected Areas (WDPA). We restricted the analyses to terrestrial protected areas with area higher than 1 square kilometer and whose designation status was one of the following: "Designated", "Inscribed", "Adopted" or "Established". The WDPA includes overlapping protected areas resulting from alternative designations or protections schemas by local and international institutions. For instance, part of a national park could be also a natural monument and be listed twice in the database. To avoid problems with overlapping areas we dissolved all overlapping spatial poligons. Greenland was removed from the dataset because of its extremely big size and northernmost location.
 
 ```{bash}
 mkdir -p /tmp/data
@@ -815,7 +181,7 @@ ndvi <- ndvi %>%
 
 #### Add continents and biomes
 ```{r}
-pacman::p_load(sf, rnaturalearth, rnaturalearthdata)
+pacman::p_load(sf)
 
 # Convert coords to sf object
 coords <- st_as_sf(coords, coords = c("X", "Y"))
@@ -823,10 +189,15 @@ coords <- st_as_sf(coords, coords = c("X", "Y"))
 st_crs(coords) <- 4326
 
 # Load continent and biome data
-continents <- ne_countries(scale = "medium", returnclass = "sf")[, c("continent", "geometry")]
+system("unzip Data/continents.zip -d /tmp")
+continents <- st_read("/tmp/continents.gdb")[, c("CONTINENT", "SHAPE")] %>%
+    rename(continent = CONTINENT, geometry = SHAPE) %>%
+    st_make_valid() %>%
+    st_transform(., st_crs(coords))
 biomes <- st_read("wwf_ecoregions/wwf_terr_ecos.shp")[, c("REALM", "geometry")] %>%
-rename(realm = REALM) %>%
-st_make_valid()
+    rename(realm = REALM) %>%
+    st_make_valid() %>%
+    st_transform(., st_crs(coords))
 
 # Add continents to coords
 coords <- st_join(coords, continents, join = st_intersects)
@@ -836,8 +207,9 @@ coords <- st_join(coords, biomes, join = st_intersects)
 
 # Add coordinates as X and Y columns and remove geometry
 coords <- coords %>%
-  mutate(X = st_coordinates(.)[, 1], Y = st_coordinates(.)[, 2]) %>%
-  st_drop_geometry()
+    mutate(X = st_coordinates(.)[, 1], Y = st_coordinates(.)[, 2],
+    lon = st_coordinates(.)[, 1], lat = st_coordinates(.)[, 2]) %>%
+    st_drop_geometry()
 ```
 
 
@@ -862,13 +234,14 @@ coords <- geo2cartesian(coords, lat = "Y", lon = "X")
 ### Merge all datasets
 
 ```{r}
-# Perform joins and handle missing values
+# Perform joins, handle missing values and calculate additional variables
 data <- data %>%
     left_join(climate, by = "WDPAID") %>%
     left_join(elevation, by = "WDPAID") %>%
     left_join(ndvi, by = "WDPAID") %>%
     left_join(coords, by = "WDPAID") %>%
     drop_na() %>%
+    mutate(ns_elongation = ns_length / ew_length) %>%
     slice_sample(n = 5000)
 
 saveRDS(data, "/tmp/wdpa.rds")
@@ -876,54 +249,147 @@ saveRDS(data, "/tmp/wdpa.rds")
 
 ## Step 2: Analysis
 
+Define predictors and responses for further analyses
+```{r}
+predictors <- c("area", "elongationratio", "normcircularity", "numpolygons", "numholes", "fractaldimension", "maxlength", "continent", "realm", "X", "Y", "Z","lon","lat")
+
+responses <- c("NDVI_p90_mean", "cv_ndvi", "n_climates", "shannon", "evenness", "elevation_range", "elevation_cv")
+```
+
+-   Paired correlations
+```{r}
+data <- readRDS("/tmp/wdpa.rds")
+
+corr_plot_resp <- GGally::ggpairs(select(data, all_of(responses))) +
+    theme_pubclean()
+
+corr_plot_pred <- GGally::ggpairs(select(data, all_of(predictors))) +
+    theme_pubclean()
+
+ggsave(str_glue("figures/corrplot_resp.png"),
+    plot = corr_plot_resp, width = 30, height = 30, units = "cm", bg = "white"
+)
+
+ggsave(str_glue("figures/corrplot_pred.png"),
+    plot = corr_plot_pred, width = 30, height = 30, units = "cm", bg = "white"
+)
+```
+
 -   Ordination with all attributes of protected areas.
 
 ```{r}
 # Load required packages
-pacman::p_load(ggplot2, vegan, dplyr)
+pacman::p_load(ggplot2, tidyverse, tidymodels, ggforce, rstatix, ggrepel, EFAtools, adegenet, geosphere, ggpubr)
 
 # Re-import dataset
 data <- readRDS("/tmp/wdpa.rds") %>%
-    na.omit() %>%
-    dplyr::select(area, elongationratio, normcircularity, numpolygons, numholes, compactnessratio, fractaldimension, ew_length, ns_length, maxlength) %>%
-    filter(area > 1 & !area == max(area))
+    select(all_of(c("WDPAID", responses, predictors))) %>%
+    recipe(~.) %>%
+    step_naomit() %>%
+    step_filter(area > 1) %>%
+    step_scale(all_numeric(), -lon, -lat) %>%
+    step_YeoJohnson(all_numeric(), -lon, -lat) %>%
+    prep() %>%
+    bake(new_data = NULL) %>%
+    cbind(., mahalanobis_distance(.)[, c("mahal.dist", "is.outlier")]) %>%
+    filter(!is.outlier)
 
+# Run Bartlett's test of sphericity (must be significant) and compute Kaiser-Meyer-Olkin criteria (must be above 0.5)
+BARTLETT(select(data, !any_of(c("WDPAID","continent", "realm", "mahal.dist", "is.outlier"))))
+KMO(select(data, !any_of(c("WDPAID","continent", "realm", "mahal.dist", "is.outlier"))))
 
+# Prepare variables for spatial PCA
+spca_vars <- c(predictors[!predictors %in% c("continent", "realm", "X","Y","Z","lon","lat","mahal.dist", "is.outlier")])
+X <- as.matrix(select(data, all_of(spca_vars)))
 
-# Perform PCA
-pca <- prcomp(data, scale. = TRUE)
+# Use coordinates for spatial information
+coords <- select(data, lon, lat) %>%
+    st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+    st_transform(crs = "+proj=moll") %>%
+    st_coordinates()
 
-# Extract PCA scores
-pca_scores <- as.data.frame(pca$x)
+# Use chooseCN to create a spatial weights list (k-nearest neighbors)
+nb <- chooseCN(coords, type = 6, k = 12, plot.nb = F, result.type = "listw")
 
-# Extract variable loadings
-pca_loadings <- as.data.frame(pca$rotation)
+# Run spatial PCA (adegenet::spca)
+spca_res <- adegenet::spca(X, cn = nb, xy = coords, scannf = FALSE, nfposi = 4, nfnega = 4)
 
-# Calculate variance explained
-variance_explained <- round((pca$sdev^2 / sum(pca$sdev^2)) * 100, 1)
-variance_labels <- paste0("PC", 1:2, " (", variance_explained[1:2], "%)")
+pca_summary <- summary(spca_res)
 
-# Plot PCA results with variance explained and variable loadings
-pca_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2)) +
-    geom_point(alpha = 0.7, color = "cyan") +
-    stat_density_2d(aes(fill = ..level..), geom = "polygon", alpha = 0.4, bins = 50) +
-    scale_fill_viridis_c() +
+# Prepare data for ggplot: axes 1 and 2, with spatial filtering (e.g., color by continent or realm)
+ordination_df <- data %>%
+    mutate(
+        sPCA1 = spca_res$li[,1],
+        sPCA2 = spca_res$li[,2]
+    )
+
+# Calculate explained variance for each sPCA axis
+explained_var <- round(100 * pca_summary$spca$var, 1)
+
+# Calculate Moran's I for each sPCA axis (positive and negative)
+library(spdep)
+moran_list <- sapply(1:ncol(spca_res$li), function(i) {
+    moran.mc(spca_res$li[,i], nb, 999)$statistic
+})
+moran_list <- round(moran_list, 2)
+
+# Calculate variable loadings for sPCA axes 1 and 2
+loadings <- as.data.frame(spca_res$c1[, 1:2])
+loadings$variable <- rownames(loadings)
+colnames(loadings)[1:2] <- c("sPCA1", "sPCA2")
+
+# Scale loadings for plotting as arrows
+arrow_scale <- 3 # adjust as needed for visual clarity
+loadings$sPCA1 <- loadings$sPCA1 * arrow_scale
+loadings$sPCA2 <- loadings$sPCA2 * arrow_scale
+
+# Prepare axis labels with explained variance and Moran's *I*
+xlab <- glue::glue("PCA1 (σ²={explained_var[1]}%, *I* = {moran_list[1]})")
+ylab <- glue::glue("PCA 2 (σ²={explained_var[2]}%, *I* = {moran_list[2]})")
+
+# Use stat_density_2d with lower alpha and fewer bins to emphasize broader, more scattered regions
+loads_color <- "gray50"
+pca_plot <- ggplot(ordination_df, aes(x = sPCA1, y = sPCA2, color = continent)) +
+    geom_point(alpha = 0.5, size = 1) +
+    stat_density_2d(
+        aes(fill = after_stat(level)),
+        geom = "polygon",
+        alpha = 1,
+        color = NA,
+        bins = 100
+    ) +
+    scale_fill_viridis_c(option = "C") +
     geom_segment(
-        data = pca_loadings, aes(x = 0, y = 0, xend = PC1 * 5, yend = PC2 * 5),
-        arrow = arrow(length = unit(0.2, "cm")), color = "gray50"
+        data = loadings,
+        aes(x = 0, y = 0, xend = sPCA1, yend = sPCA2),
+        arrow = arrow(length = unit(0.25, "cm")),
+        color = loads_color,
+        inherit.aes = FALSE
     ) +
-    ggrepel::geom_text_repel(
-        data = pca_loadings, aes(x = PC1 * 5, y = PC2 * 5, label = rownames(pca_loadings)),
-        color = "black", max.overlaps = Inf
+    geom_text_repel(
+        data = loadings,
+        aes(x = sPCA1, y = sPCA2, label = variable),
+        color = loads_color,
+        size = 3,
+        hjust = 0.5, vjust = -0.5,
+        inherit.aes = FALSE
     ) +
+    theme_pubr() +
     labs(
-        title = "PCA Plot",
-        x = variance_labels[1], y = variance_labels[2]
+        title = "",
+        x = bquote(PCA[1]~"(σ²="*.(explained_var[1])*"%, " * italic(I) * "=" * .(moran_list[1]) * ")"),
+        y = bquote(PCA[2]~"(σ²="*.(explained_var[2])*"%, " * italic(I) * "=" * .(moran_list[2]) * ")"),
+        fill = "Density",
+        color = "Continent"
     ) +
-    ggpubr::theme_pubr() +
-    scale_color_viridis_d(option = "D", begin = 0.2, end = 0.8) +
-    theme(legend.position = "right", legend.direction = "vertical")
-```
+    guides(
+        fill = guide_colorbar(title = "Density", title.position = "top", title.hjust = 0.5),
+        color = guide_legend(title = "", title.position = "top", title.hjust = 0.5)
+    ) +
+    theme(legend.position = "bottom")
+
+ggsave("figures/spca_plot.png", plot = pca_plot, width = 20, height = 22, units = "cm", bg = "white")
+```    
 
 -   **H1**: Test the relationship between elongation and CV-EVI (and CV-NDVI) while controlling for area.
 -   **H2**: Test the marginal effect of length in the North-South axis.
@@ -946,27 +412,27 @@ pacman::p_load(tidymodels, tidyverse, future, doRNG, GGally, tictoc, pdp, foreac
 # Re-import dataset
 data <- readRDS("/tmp/wdpa.rds") %>%
     na.omit() %>%
-    dplyr::select(-matches("WDPAID|^intersecting|^bucket|histogram_numeric|stdDev$")) %>%
+    dplyr::select(-matches("^intersecting|^bucket|histogram_numeric|stdDev$")) %>%
     filter(ns_length >= 1, ew_length >= 1) %>%
     mutate(ns_elongation = ns_length / ew_length)
-
-predictors <- c("area", "elongationratio", "normcircularity", "numpolygons", "numholes", "fractaldimension", "ns_elongation", "maxlength", "continent", "realm", "X", "Y", "Z")
-
-responses <- c("EVI_p90_mean", "NDVI_p90_mean", "cv_evi", "cv_ndvi", "n_climates", "shannon", "simpson", "evenness")
 
 split_prop <- 3 / 4
 ml_engine <- "ranger"
 ml_mode <- "regression"
-ml_importance <- "impurity"
 ml_metrics <- metric_set(rmse, rsq, mae)
+
+my_sapply <- function(X, FUN, ...) {
+  sapply(X, FUN, ..., simplify = FALSE, USE.NAMES = TRUE)
+}
+
 ```
 
 ## Tuning parameters:
 
 ```{r}
 tuning_params <- expand.grid(
-    mtry = seq(2, length(predictors), by = 3), # number predictors
-    trees = seq(100, 1000, by = 100), # Number of trees
+    mtry = seq(from = 2, to = length(predictors), by = 3), # number predictors
+    trees = c(100, seq(250, 5000, by = 250)), # Number of trees
     min_n = c(2, 5) # Minimum number of samples required to split an
 )
 
@@ -1034,8 +500,13 @@ ml_cv <- vfold_cv(training(ml_split))
 ```{r}
 # https://recipes.tidymodels.org/articles/Ordering.html
 
-ml_recipes <- lapply(responses, function(y) {
-    formula <- as.formula(paste(y, paste(predictors, collapse = "+"), sep = "~"))
+ml_recipes <- my_sapply(responses,function(y) {
+    formula <- as.formula(paste(y, 
+    paste(predictors[!predictors %in% c("lon","lat")], 
+    collapse = "+"), sep = "~"))
+
+    print(formula)
+
     ml_recipe <- recipe(formula, data = ml_data) %>%
         # Pre-processing steps
         ## Transform numeric predictors
@@ -1048,6 +519,8 @@ ml_recipes <- lapply(responses, function(y) {
         # step_normalize(all_numeric()) %>%
         # Remove NAs
         step_naomit()
+
+        return(ml_recipe)
 })
 ```
 
@@ -1055,27 +528,27 @@ ml_recipes <- lapply(responses, function(y) {
 
 ```{r}
 ml_model <-
-  # specify that the model is a random forest
-  rand_forest() %>%
-  # Parameters to be tuned
-  set_args(
-    mtry = tune(),
-    trees = tune(),
-    min_n = tune()
-  ) %>%
-  # Select the modeling engine
-  set_engine(engine = ml_engine, importance = "impurity") %>%
-  # Select between regression and binary classification
-  set_mode(ml_mode)
+    # specify that the model is a random forest
+    rand_forest() %>%
+    # Parameters to be tuned
+    set_args(
+        mtry = tune(),
+        trees = tune(),
+        min_n = tune()
+    ) %>%
+    # Select the modeling engine
+    set_engine(engine = ml_engine, importance = "permutation") %>%
+    # Select between regression and binary classification
+    set_mode(ml_mode)
 ```
 
 ## Create a workflow
 
 ```{r}
-ml_workflows <- lapply(ml_recipes, function(recipe) {
+ml_workflows <- my_sapply(names(ml_recipes), function(recipe) {
     ml_workflow <- workflow() %>%
         # add the recipe
-        add_recipe(recipe) %>%
+        add_recipe(ml_recipes[[recipe]]) %>%
         # add the model
         add_model(ml_model)
 })
@@ -1095,7 +568,8 @@ tic()
 ml_tune_results <- lapply(ml_workflows, function(workflow) {
     workflow %>%
         tune_grid(
-            resamples = ml_cv, # Cross-validation data object
+            # Cross-validation data object
+            resamples = ml_cv, 
             # Grid of hyperparameters
             grid = tuning_params,
             # Metrics to evaluate
@@ -1110,19 +584,19 @@ saveRDS(ml_tune_results, "rds_backups/ml_tune_results.rds")
 ## Plot tunned parameters
 
 ```{r}
+# Re-import tuning results
+ml_tune_results <- readRDS("rds_backups/ml_tune_results.rds")
+
 # Generate and display plots for each element in ml_tune_results
 lapply(ml_tune_results, function(x) {
     autoplot(x) + ggtitle("Tuning Results")
 })
 ```
 
-![](rftune.png)
-
 ## Collect and evaluate results
 
 ```{r}
-ml_tune_results <- readRDS("rds_backups/ml_tune_results.rds")
-
+#| eval: true
 ml_tune_results <- lapply(ml_tune_results, function(x) {
     select_best(x, metric = "rmse")
 })
@@ -1133,29 +607,40 @@ print(ml_tune_results)
 ## Finalize workflow
 
 ```{r}
+#| eval: true
 for (x in 1:length(ml_workflows)) {
-ml_workflows[[x]] <- finalize_workflow(ml_workflows[[x]], 
-ml_tune_results[[x]])
+    ml_workflows[[x]] <- finalize_workflow(
+        ml_workflows[[x]],
+        ml_tune_results[[x]]
+    )
 }
-
 ```
 
 # Fit the final model to the training and testing data
 
 ```{r}
+#| eval: true
 ml_fits <- lapply(ml_workflows, function(workflow) {
     workflow %>%
-    # fit on the training set and evaluate on test set
-    last_fit(ml_split)
+        # fit on the training set and evaluate on test set
+        last_fit(ml_split)
 })
 ```
 
 check results
 
 ```{r}
-test_performance <- lapply(ml_fits, function(ml_fit) {ml_fit %>% collect_metrics()})
+test_performance <- lapply(ml_fits, function(ml_fit) {
+    ml_fit %>% collect_metrics()
+})
 
 names(test_performance) <- responses
+
+test_performance <- bind_rows(test_performance, .id = "Response")
+
+test_performance <- test_performance %>%
+    select(Response, .metric, .estimate) %>%
+    pivot_wider(names_from = .metric, values_from = .estimate)
 
 test_performance
 
@@ -1165,78 +650,125 @@ test_performance
 
 ### Variable importance plots
 ```{r}
-pacman::p_load(vip)
+pacman::p_load(vip, patchwork, dplyr, ggplot2)
 
 names(ml_fits) <- responses
 
-plot_varimportance <- function(model, fileid = NULL, num_features = 15, geom = "col"){
-f_model <- extract_fit_parsnip(model)
+extract_varimportance <- function(model, response, num_features = 15) {
+    f_model <- extract_fit_parsnip(model)
+    importance_scores <- vip(f_model$fit, num_features = num_features, geom = "col")$data
+    importance_scores <- importance_scores %>%
+        mutate(Response = response) # Add response variable for faceting
+    return(importance_scores)
+}
 
-# Plot variable importance
-importance_scores <- vip(f_model$fit, num_features = num_features, geom = geom)
-importance_scores
+# Extract importance scores for all models and combine into a single dataframe
+vip_data <- bind_rows(lapply(names(ml_fits), function(response) {
+    extract_varimportance(ml_fits[[response]], response)
+}))
 
-# Define a custom color scale with blue shades
-blue_shades <- colorRampPalette(c("lightblue", "darkblue"))(num_features)
-
-# Plot with custom blue shades
-ggplot(importance_scores$data, aes(x = reorder(Variable, Importance), y = Importance, fill = Importance)) +
-    geom_col() +
-    scale_fill_gradient(low = "lightblue", high = "darkblue") +
+# Plot variable importance with facets and merged x axes
+vip_plot <- ggplot(vip_data, aes(x = reorder(Variable, Importance), y = Importance)) +
+    geom_col(fill = "lightblue") +
     coord_flip() +
-    theme_minimal() +
-    labs(title = "Variable Importance Plot", x = "Variables", y = "Importance")
+    theme_pubr() +
+    theme(legend.position = "none") + # Remove the legend
+    facet_wrap(~Response, scales = "free_x") + # Use scales = "free_y" to merge x axes
+    labs(title = "", x = "", y = "")
 
-ggsave(str_glue("figures/{fileid}_variable_importance_plot.png"),
-    width = 15, height = 10, units = "cm", bg = "white"
+# Save the plot
+ggsave("figures/faceted_variable_importance_plots.png",
+    plot = vip_plot, width = 20, height = 30, units = "cm", bg = "white"
 )
+
+vip_plot
+```
+
+#### Interactions
+```{r}
+pacman::p_load(hstats, ggpubr)
+
+names(ml_fits) <- responses
+
+plot_interactions <- function(model, fileid = NULL, background_data = NULL) {
+    results <- list()
+    model <- extract_workflow(model)
+    hstat <- hstats(model, X = background_data)
+
+    h2_stat <- hstat$h2$num / hstat$h2$denom
+
+    plot <- plot(hstat) +
+        theme_pubr() +
+        annotate("text",
+            x = Inf, y = -Inf, label = paste0("h² = ", round(h2_stat, 2)),
+            hjust = 1.1, vjust = -0.5, size = 4, color = "blue"
+        )
+
+    results[["plot_norm"]] <- plot
+
+    results[["plot_not_norm"]] <- plot(h2_pairwise(hstat, normalize = FALSE, squared = FALSE)) +
+        theme_pubr()
+
+    return(results)
 }
 
 # Loop over the models
-sapply(names(ml_fits), USE.NAMES = T, simplify = F, function(x){
-    plot_varimportance(ml_fits[[x]], fileid = x)
-})
+library(parallel)
+
+mcmapply(function(response) {
+    res <- plot_interactions(
+        model = ml_fits[[response]],
+        fileid = response,
+        background_data = ml_data %>% select(all_of(c(response, predictors)))
+    )
+
+    ggsave(plot = res[["plot_norm"]], filename = str_glue("figures/{response}_normalized_interactions.png"))
+
+    ggsave(plot = res[["plot_not_norm"]], filename = str_glue("figures/{response}_interactions_strength.png"))
+}, names(ml_fits), USE.NAMES = TRUE, SIMPLIFY = FALSE, mc.cores = parallel::detectCores() - 1)
 ```
 
 #### Partial dependence plots
 
 ```{r}
-pacman::p_load(hstats)
+pacman::p_load(vip)
 
 names(ml_fits) <- responses
 
-plot_partial_dependence <- function(model, feature, fileid = NULL, background_data = NULL) {
-  f_model <- extract_fit_parsnip(model)
-  
-  # Generate partial dependence data
-  pd_data <- hstats::partial_dep(f_model$fit, feature, X = background_data %>% select(all_of(predictors)))
-  
-  # Plot partial dependence
-  pd_plot <- ggplot(pd_data, aes_string(x = feature, y = "partial_dependence")) +
-    geom_line(color = "blue") +
-    theme_minimal() +
-    labs(
-      title = paste("Partial Dependence Plot for", feature),
-      x = feature,
-      y = "Partial Dependence"
-    )
-  
-  # Save the plot
-  if (!is.null(fileid)) {
-    ggsave(str_glue("figures/{fileid}_partial_dependence_{feature}.png"),
-           plot = pd_plot, width = 15, height = 10, units = "cm", bg = "white"
-    )
-  }
-  
-  return(pd_plot)
+plot_partial_dependence <- function(model, features, fileid = NULL, background_data = NULL) {
+    f_model <- extract_fit_parsnip(model)
+
+    # Generate partial dependence data
+    pd_data <- hstats::partial_dep(f_model$fit, v = features, X = background_data %>% select(all_of(features)))
+
+    # Plot partial dependence
+    pd_plot <- ggplot(pd_data, aes_string(x = features, y = "partial_dependence")) +
+        geom_line(color = "blue") +
+        theme_minimal() +
+        labs(
+            title = "",
+            x = "",
+            y = "Partial Dependence"
+        )
+
+    # Save the plot
+    if (!is.null(fileid)) {
+        ggsave(str_glue("figures/{fileid}_partial_dependence_{feature}.png"),
+            plot = pd_plot, width = 15, height = 10, units = "cm", bg = "white"
+        )
+    }
+
+    return(pd_plot)
 }
 
 # Loop over the models and features
 sapply(names(ml_fits), USE.NAMES = T, simplify = F, function(response) {
-  features <- predictors  # Use predictors as features for partial dependence
-  lapply(features, function(feature) {
-    plot_partial_dependence(ml_fits[[response]], feature = "normcircularity", fileid = response, background_data = ml_data)
-  })
+    required_features <- c("maxlength", "Z")
+    if (all(required_features %in% colnames(ml_data))) {
+        plot_partial_dependence(ml_fits[[response]], features = required_features, fileid = response, background_data = ml_data)
+    } else {
+        warning(str_glue("Skipping {response}: Required features not found in data."))
+    }
 })
 ```
 

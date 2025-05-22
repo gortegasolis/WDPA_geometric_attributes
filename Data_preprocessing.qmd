@@ -1,0 +1,579 @@
+
+
+```{r}
+# Connect to database
+source("con.r")
+
+# 1. Create ranked materialized view
+dbExecute(con, "
+CREATE MATERIALIZED VIEW admin.matview_ranked_polygons_1
+AS
+SELECT p.wdpaid,
+  p.geometry,
+  ROW_NUMBER() OVER (ORDER BY st_area(p.geometry) DESC) AS rank
+FROM wdpa_poly_jan2025 AS p
+WHERE marine = '0'
+  AND gis_area > 0
+  AND status IN ('Designated', 'Inscribed', 'Adopted', 'Established')
+WITH NO DATA;
+")
+
+# Add spatial index
+dbExecute(con, "CREATE INDEX matview_ranked_polygons_geom_idx ON admin.matview_ranked_polygons_1 USING GIST(geometry);")
+
+# Add index on wdpaid
+dbExecute(con, "CREATE INDEX matview_ranked_polygons_wdpaid_idx ON admin.matview_ranked_polygons_1 (wdpaid);")
+
+# 2. Create clustered materialized view
+dbExecute(con, "
+CREATE MATERIALIZED VIEW admin.matview_clustered_polygons_2
+AS
+SELECT r.wdpaid,
+  r.geometry,
+  st_clusterdbscan(r.geometry, 0::double precision, 1) OVER () AS cluster_id
+FROM admin.matview_ranked_polygons_1 r
+WITH NO DATA;
+")
+
+# Add spatial index
+dbExecute(con, "CREATE INDEX matview_clustered_polygons_geom_idx ON admin.matview_clustered_polygons_2 USING GIST(geometry);")
+
+# Add index on wdpaid
+dbExecute(con, "CREATE INDEX matview_clustered_polygons_wdpaid_idx ON admin.matview_clustered_polygons_2 (wdpaid);")
+
+# 3. Create dissolved materialized view
+dbExecute(con, "
+CREATE MATERIALIZED VIEW admin.matview_land_dissolved_polygons_3
+AS
+SELECT st_union(geometry) AS dissolved_geom,
+  array_agg(DISTINCT wdpaid) AS wdpaid
+FROM admin.matview_clustered_polygons
+GROUP BY cluster_id
+WITH NO DATA;
+")
+
+# Add spatial index
+dbExecute(con, "CREATE INDEX matview_land_dissolved_geom_idx ON admin.matview_land_dissolved_polygons_3 USING GIST(dissolved_geom);")
+
+# Add index on wdpaid
+dbExecute(con, "CREATE INDEX matview_land_dissolved_wdpaid_idx ON admin.matview_land_dissolved_polygons_3 USING gin(wdpaid);")
+
+# Refresh the views with data
+dbExecute(con, "REFRESH MATERIALIZED VIEW admin.matview_ranked_polygons_1;")
+dbExecute(con, "REINDEX INDEX admin.matview_ranked_polygons_geom_idx;")
+dbExecute(con, "REINDEX INDEX admin.matview_ranked_polygons_wdpaid_idx;")
+
+dbExecute(con, "REFRESH MATERIALIZED VIEW admin.matview_clustered_polygons_2;")
+dbExecute(con, "REINDEX INDEX admin.matview_clustered_polygons_geom_idx;")
+dbExecute(con, "REINDEX INDEX admin.matview_clustered_polygons_wdpaid_idx;")
+
+dbExecute(con, "REFRESH MATERIALIZED VIEW admin.matview_land_dissolved_polygons_3;")
+dbExecute(con, "REINDEX INDEX admin.matview_land_dissolved_geom_idx;")
+dbExecute(con, "REINDEX INDEX admin.matview_land_dissolved_wdpaid_idx;")
+```
+
+Since some areas overlap, we created an additional table to identify the set of intersecting WDPAIDs per polygon.
+
+```{sql}
+-- 2. Create intersection analysis with optimized joins
+CREATE MATERIALIZED VIEW admin.terrestrial_intersections_2 AS
+SELECT
+    a.wdpaid,
+    ARRAY_AGG(DISTINCT b.wdpaid) AS intersecting_ids
+FROM admin.terrestrial_geometry_1 a
+JOIN admin.terrestrial_geometry_1 b 
+  ON a.wdpaid <> b.wdpaid
+  AND ST_INTERSECTS(a.geometry, b.geometry)
+GROUP BY a.wdpaid;
+```
+
+Add a spatial index to the new table.
+
+```{sql}
+CREATE INDEX ti2_wdpaid_idx ON admin.terrestrial_intersections_2 (wdpaid);
+```
+
+We create a combined view of the two previous tables.
+
+```{sql}
+-- 3. Create final combined view
+CREATE OR REPLACE VIEW admin.wdpaid_terrestrial_union AS
+SELECT
+    g.wdpaid,
+    g.geometry,
+    COALESCE(i.intersecting_ids, ARRAY[]::bigint[]) AS intersecting_ids
+FROM admin.terrestrial_geometry_1 g
+LEFT JOIN admin.terrestrial_intersections_2 i
+  ON g.wdpaid = i.wdpaid;
+```
+
+With the previous view in place we can create a materialized view to pull data from it.
+
+```{sql}
+-- 4. Create public-facing materialized view
+CREATE MATERIALIZED VIEW public.wdpaid_terrestrial_union AS
+SELECT * FROM admin.wdpaid_terrestrial_union;
+```
+
+Add a spatial index to the materialized view.
+
+```{sql}
+-- Add final indexes
+CREATE INDEX wtu_geometry_idx ON public.wdpaid_terrestrial_union USING GIST(geometry);
+```
+
+Add an index to the unique identifier in the materialized view.
+
+```{sql}
+CREATE INDEX wtu_wdpaid_idx ON public.wdpaid_terrestrial_union (wdpaid);
+```
+
+## Step 2: Characterization of Geometrical Dimensions
+
+We first characterized the fundamental geometrical dimensions (axes) of the PAs. This step is essential to address potential collinearities among geometrical characteristics. For instance, elongated areas may be large, round areas may be small, and fragmented areas may have low area-perimeter ratios.
+
+```{sql}
+-- 1. Geometry metrics view and materialized view
+CREATE OR REPLACE VIEW admin.matview_geometric_metrics
+ AS
+ SELECT data.wdpaid,
+    st_area(data.geometry::geography) / 1000000.0::double precision AS area_km2,
+        CASE
+            WHEN mbr.short > 0::double precision THEN mbr.long / mbr.short
+            ELSE 0::double precision
+        END AS elongationratio,
+    4.0::double precision * pi() * (st_area(data.geometry::geography) / 1000000.0::double precision) / NULLIF(power(st_perimeter(data.geometry::geography) / 1000.0::double precision, 2::double precision), 0::double precision) AS normcircularity,
+    st_numgeometries(data.geometry) AS numpolygons,
+    st_nrings(data.geometry) - st_numgeometries(data.geometry) AS numholes,
+        CASE
+            WHEN mbr.hull_area > 0::double precision THEN st_area(data.geometry::geography) / 1000000.0::double precision / mbr.hull_area
+            ELSE 0::double precision
+        END AS compactnessratio,
+        CASE
+            WHEN (st_perimeter(data.geometry::geography) / 1000.0::double precision) > 0::double precision AND (st_area(data.geometry::geography) / 1000000.0::double precision) > 0::double precision THEN 2.0::double precision * ln(st_perimeter(data.geometry::geography) / 1000.0::double precision) / ln(st_area(data.geometry::geography) / 1000000.0::double precision)
+            ELSE NULL::double precision
+        END AS fractaldimension
+   FROM wdpaid_terrestrial_union data
+     LEFT JOIN LATERAL ( SELECT st_area(st_convexhull(data.geometry)::geography) / 1000000.0::double precision AS hull_area,
+            st_distance(p1.p1::geography, p2.p2::geography) / 1000.0::double precision AS long,
+            st_distance(p2.p2::geography, p3.p3::geography) / 1000.0::double precision AS short
+           FROM st_orientedenvelope(data.geometry) oe(oe),
+            LATERAL st_pointn(st_exteriorring(oe.oe), 1) p1(p1),
+            LATERAL st_pointn(st_exteriorring(oe.oe), 2) p2(p2),
+            LATERAL st_pointn(st_exteriorring(oe.oe), 3) p3(p3)) mbr ON true;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.mv_geometric_metrics
+ SELECT * FROM admin.matview_geometric_metrics;
+
+----------------------------------------------------------------------------------------------------------
+-- 2. Extension metrics view and materialized view
+CREATE OR REPLACE VIEW admin.matview_spatial_extension
+ AS
+ SELECT wdpaid_terrestrial_union.wdpaid,
+    st_distance(st_makepoint(st_xmin(box.box::box3d), (st_ymin(box.box::box3d) + st_ymax(box.box::box3d)) / 2::double precision)::geography, st_makepoint(st_xmax(box.box::box3d), (st_ymin(box.box::box3d) + st_ymax(box.box::box3d)) / 2::double precision)::geography) / 1000::double precision AS ew_length,
+    st_distance(st_makepoint((st_xmin(box.box::box3d) + st_xmax(box.box::box3d)) / 2::double precision, st_ymin(box.box::box3d))::geography, st_makepoint((st_xmin(box.box::box3d) + st_xmax(box.box::box3d)) / 2::double precision, st_ymax(box.box::box3d))::geography) / 1000::double precision AS ns_length,
+    (( SELECT max(st_distance(a.geom::geography, b.geom::geography)) AS max
+           FROM st_dumppoints(st_convexhull(wdpaid_terrestrial_union.geometry)) a(path, geom),
+            st_dumppoints(st_convexhull(wdpaid_terrestrial_union.geometry)) b(path, geom))) / 1000::double precision AS maxlength_km
+   FROM wdpaid_terrestrial_union
+     CROSS JOIN LATERAL st_envelope(wdpaid_terrestrial_union.geometry) box(box);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.mv_extension_metrics
+ SELECT * FROM admin.matview_spatial_extension; 
+
+-----------------------------------------------------------------------------------------------------------
+-- 3. Combined view
+CREATE OR REPLACE VIEW public."MOBI_WDPA_land_combined_metrics"
+ AS
+ SELECT base.wdpaid,
+    base.intersecting_ids,
+    geom.area_km2 AS area,
+    geom.elongationratio,
+    geom.normcircularity,
+    geom.numpolygons,
+    geom.numholes,
+    geom.compactnessratio,
+    geom.fractaldimension,
+    ext.ew_length,
+    ext.ns_length,
+    ext.maxlength_km AS maxlength
+   FROM wdpaid_terrestrial_union base
+     JOIN mv_geometric_metrics geom USING (wdpaid)
+     JOIN mv_extension_metrics ext USING (wdpaid);
+```
+
+Define Python environment for reticulate.
+```{r}
+library(reticulate)
+py_config()
+```
+
+We extracted elevation data from Copernicus WorldEM-30.
+
+```{python}
+# Author: Gabriel Ortega
+
+# This script is organized in four sections:
+# 1. SETTINGS: Contains information about the input data and some pre-processing steps.
+# 2. FUNCTION(S): Main function(s) to apply.
+# 3. EXECUTION: Apply the function(s) to the input data.
+# 4. EXPORT RESULTS: Export outside of EarthEngine.
+
+import ee
+ee.Authenticate()
+ee.Initialize(project='gortega-research')
+
+############################################################################################################################
+# 1. SETTINGS
+
+# Polygons collection
+table = ee.FeatureCollection("projects/gortega-research/assets/WDPA_dissolved")  # Explicitly define WDPA polygons
+# Unique polygons identifier
+uniqueID = 'uniqueid'
+
+# Elevation Dataset
+elevationDataset = ee.ImageCollection("COPERNICUS/DEM/GLO30")  # Use the Copernicus DEM GLO 30m
+elevationBand = 'DEM'  # Band name for elevation is 'DEM'
+waterMaskBand = 'WBM'  # Band name for water mask is 'WBM'
+
+# Create a bounding box if necessary
+
+# Original bounding box coordinates
+xmin, ymin, xmax, ymax = -180, 90, 180, -90  # Full bounding box
+
+# Loop over whichBox from 1 to 16
+for whichBox in range(1, 17):
+  # Initialize bbox variable
+  if whichBox == 0:
+    # Full bounding box
+    bbox = ee.Geometry.BBox(xmin, ymin, xmax, ymax)
+  else:
+    # Grid configuration (4x4)
+    xSegments, ySegments = 4, 4
+
+    # Calculate step sizes
+    xStep = (xmax - xmin) / xSegments  # 45° per column
+    yStep = (ymax - ymin) / ySegments  # -22.5° per row
+
+    # Convert whichBox (1-16) to grid indices
+    adjustedIndex = whichBox - 1
+    row = adjustedIndex // xSegments  # 0-3 (bottom to top)
+    col = adjustedIndex % xSegments  # 0-3 (left to right)
+
+    # Reverse row order (original grid is top to bottom)
+    yIndex = (ySegments - 1) - row
+
+    # Calculate coordinates
+    xStart = xmin + col * xStep
+    xEnd = xStart + xStep
+    yStart = ymin + yIndex * yStep
+    yEnd = yStart + yStep
+
+    bbox = ee.Geometry.BBox(xStart, yStart, xEnd, yStart)
+
+  # Name of output file
+  fileName = f'elevation_stats_WDPA_{xmin}_{ymin}_{xmax}_{ymax}_bbox{whichBox}'
+
+  # Filter polygons dataset as required
+  filteredPols = table.filterBounds(bbox)
+
+  ############################################################################################################################
+  # 2. FUNCTION(S)
+
+  def processData():
+    def calculateStats(feature):
+      combinedGeometry = feature.geometry()
+
+      # Get the elevation and water mask bands. Since elevationDataset is a collection, we need to mosaic it.
+      elevation = elevationDataset.select(elevationBand).mosaic()
+      waterMask = elevationDataset.select(waterMaskBand).mosaic()
+
+      # Apply the water mask:
+      # WBM values: 0=No water, 1=Ocean, 2=Lake, 3=River.
+      # We want to include land, which is WBM == 0.
+      maskedElevation = elevation.updateMask(waterMask.eq(0))  # Keep only where WBM == 0
+
+      # Calculate elevation statistics.
+      stats = maskedElevation.reduceRegion(
+        reducer=ee.Reducer.min()
+        .combine(ee.Reducer.max(), None, True)
+        .combine(ee.Reducer.mean(), None, True)
+        .combine(ee.Reducer.stdDev(), None, True),
+        geometry=combinedGeometry,
+        scale=30,
+        maxPixels=1e13,
+        bestEffort=True
+      )
+
+      renamedStats = {
+        'elevation_min': stats.get('DEM_min'),
+        'elevation_max': stats.get('DEM_max'),
+        'elevation_mean': stats.get('DEM_mean'),
+        'elevation_stdDev': stats.get('DEM_stdDev'),
+      }
+      return ee.Feature(None, renamedStats).set('uniqueID', feature.get('uniqueID'))
+
+    features = filteredPols.map(calculateStats)
+    return ee.FeatureCollection(features)
+
+  ############################################################################################################################
+  # 3. EXECUTION
+
+  allFeatures = processData()
+
+  ############################################################################################################################
+  # 4. EXPORT RESULTS
+
+  task = ee.batch.Export.table.toDrive(
+    collection=allFeatures,
+    description=fileName,
+    fileFormat='CSV',
+    folder='Earthengine_exports'
+  )
+  task.start()
+```
+
+We extracted climate data from ...
+
+```{python}
+# Authors: Gabriel Ortega
+
+# This script is organized in four sections:
+# 1. SETTINGS: Contains information about the input data and some pre-processing steps.
+# 2. FUNCTION(S): Main function(s) to apply.
+# 3. EXECUTION: Apply the function(s) to the input data.
+# 4. EXPORT RESULTS: Export outside of EarthEngine.
+
+import ee
+ee.Authenticate()
+ee.Initialize(project='gortega-research')
+
+############################################################################################################################
+# 1. SETTINGS
+
+# Polygons collection
+table = ee.FeatureCollection("projects/gortega-research/assets/WDPA_dissolved")  # Explicitly define WDPA polygons
+# Unique polygons identifier
+uniqueID = 'uniqueid'
+
+# Climate Dataset
+climateDataset = ee.Image('projects/gortega-research/assets/koppen_geiger_0p01')  # Koppen-Geiger climate zones
+climateBand = 'b1'  # Band name for climate classification
+
+# Create a bounding box if necessary
+
+# Original bounding box coordinates
+xmin, ymin, xmax, ymax = -180, 90, 180, -90  # Full bounding box
+
+# Loop over whichBox from 1 to 16
+for whichBox in range(1, 17):
+  # Initialize bbox variable
+  if whichBox == 0:
+    # Full bounding box
+    bbox = ee.Geometry.BBox(xmin, ymin, xmax, ymax)
+  else:
+    # Grid configuration (4x4)
+    xSegments, ySegments = 4, 4
+
+    # Calculate step sizes
+    xStep = (xmax - xmin) / xSegments  # 45° per column
+    yStep = (ymax - ymin) / ySegments  # -22.5° per row
+
+    # Convert whichBox (1-16) to grid indices
+    adjustedIndex = whichBox - 1
+    row = adjustedIndex // xSegments  # 0-3 (bottom to top)
+    col = adjustedIndex % xSegments  # 0-3 (left to right)
+
+    # Reverse row order (original grid is top to bottom)
+    yIndex = (ySegments - 1) - row
+
+    # Calculate coordinates
+    xStart = xmin + col * xStep
+    xEnd = xStart + xStep
+    yStart = ymin + yIndex * yStep
+    yEnd = yStart + yStep
+
+    bbox = ee.Geometry.BBox(xStart, yStart, xEnd, yEnd)
+
+  # Name of output file
+  fileName = f'climate_analysis_WDPA_{xmin}_{ymin}_{xmax}_{ymax}_bbox{whichBox}'
+
+  # Filter polygons dataset as required
+  filteredPols = table.filterBounds(bbox)
+
+  ############################################################################################################################
+  # 2. FUNCTION(S)
+  def processData():
+    def calculateStats(feature):
+        combinedGeometry = feature.geometry()
+
+        # Get the climate data.
+        climate = climateDataset.select(climateBand)
+
+        # Use a histogram to get the pixel counts for each climate category within the combined polygon.
+        climateStats = climate.reduceRegion(
+            reducer=ee.Reducer.histogram(),
+            geometry=combinedGeometry,
+            scale=100,
+            maxPixels=1e13
+        )
+
+        # Get the total number of pixels in the combined polygon.
+        totalPixels = climate.reduceRegion(
+            reducer=ee.Reducer.count(),
+            geometry=combinedGeometry,
+            scale=100,
+            maxPixels=1e13
+        ).get(climateBand)
+
+        results = {
+            'climate_histogram': climateStats.get(climateBand),
+            'total_pixels': totalPixels
+        }
+
+        return ee.Feature(None, results).set(uniqueID, feature.get(uniqueID))
+
+    features = filteredPols.map(calculateStats)
+    return ee.FeatureCollection(features)
+
+  ############################################################################################################################
+  # 3. EXECUTION
+
+  allFeatures = processData()
+
+  ############################################################################################################################
+  # 4. EXPORT RESULTS
+  task = ee.batch.Export.table.toDrive(
+    collection=allFeatures,
+    description=fileName,
+    fileFormat='CSV',
+    folder='Earthengine_exports'
+  )
+  task.start()
+```
+
+Finally we extracted NDVI data from
+
+```{python}
+# Authors: Gabriel Ortega & Michela Perrone
+
+# This script is organized in four sections:
+# 1. SETTINGS: Contains information about the input data and some pre-processing steps.
+# 2. FUNCTION(S): Main function(s) to apply.
+# 3. EXECUTION: Apply the function(s) to the input data.
+# 4. EXPORT RESULTS: Export outside of EarthEngine.
+
+import ee
+ee.Authenticate()
+ee.Initialize(project='gortega-research')
+
+############################################################################################################################
+# 1. SETTINGS
+
+# Polygons collection
+table = ee.FeatureCollection("projects/gortega-research/assets/WDPA_dissolved")  # Explicitly define WDPA polygons
+# Unique polygons identifier
+uniqueID = 'uniqueid'
+
+# Rasters collection
+collection = 'MODIS/061/MOD13Q1'
+
+# Set years of interest
+startYear = 2000
+endYear = 2024
+
+# Select bands of interest
+bands = ['NDVI', 'EVI']
+qualityBand = 'SummaryQA'
+qualityValue = 0
+scaleFactor = 0.0001
+
+# Create a bounding box if necessary
+
+# Original bounding box coordinates
+xmin, ymin, xmax, ymax = -180, 90, 180, -90  # Full bounding box
+
+# Loop over whichBox from 1 to 16
+for whichBox in range(1, 17):
+  # Initialize bbox variable
+  if whichBox == 0:
+    # Full bounding box
+    bbox = ee.Geometry.BBox(xmin, ymin, xmax, ymax)
+  else:
+    # Grid configuration (4x4)
+    xSegments, ySegments = 4, 4
+
+    # Calculate step sizes
+    xStep = (xmax - xmin) / xSegments  # 45° per column
+    yStep = (ymax - ymin) / ySegments  # -22.5° per row
+
+    # Convert whichBox (1-16) to grid indices
+    adjustedIndex = whichBox - 1
+    row = adjustedIndex // xSegments  # 0-3 (bottom to top)
+    col = adjustedIndex % xSegments  # 0-3 (left to right)
+
+    # Reverse row order (original grid is top to bottom)
+    yIndex = (ySegments - 1) - row
+
+    # Calculate coordinates
+    xStart = xmin + col * xStep
+    xEnd = xStart + xStep
+    yStart = ymin + yIndex * yStep
+    yEnd = yStart + yStep
+
+    bbox = ee.Geometry.BBox(xStart, yStart, xEnd, yEnd)
+
+  # Name of output file
+  fileName = f'mean_sd_NDVI_EVI_WDPA_{xmin}_{ymin}_{xmax}_{ymax}_{startYear}_{endYear}_bbox{whichBox}'
+
+  # Filter polygons dataset as required
+  filteredPols = table.filterBounds(bbox)
+
+############################################################################################################################
+# 2. FUNCTION(S)
+
+def processData(year):
+    startDate = ee.Date.fromYMD(year, 1, 1)  # Indicate a starting date
+    endDate = ee.Date.fromYMD(ee.Number(year).add(1), 1, 1)  # Indicate an ending date
+
+    # 2.1. Image Processing:
+    processedImage = ee.ImageCollection(collection) \
+        .filterDate(startDate, endDate) \
+        .select(bands + [qualityBand]) \
+        .map(lambda image: image.updateMask(image.select(qualityBand).eq(qualityValue)).select(bands)) \
+        .reduce(ee.Reducer.percentile([90])) \
+        .multiply(scaleFactor)
+
+    # 2.2. Feature Generation:
+    features = filteredPols.map(lambda feature: ee.Feature(
+        None,
+        processedImage.reduceRegion(
+            reducer=ee.Reducer.mean().combine(ee.Reducer.stdDev(), None, True),
+            geometry=feature.geometry(),
+            scale=250,
+            maxPixels=1e13,
+            bestEffort=True
+        ).set(uniqueID, feature.get(uniqueID)).set('year', year)
+    ))
+
+    # 2.5. Return all results
+    return features
+
+  ############################################################################################################################
+  # 3. EXECUTION
+
+  allFeatures = ee.FeatureCollection(
+    ee.List.sequence(startYear, endYear).map(processData).flatten()
+  ).flatten()
+
+  ############################################################################################################################
+  # 4. EXPORT RESULTS
+
+  task = ee.batch.Export.table.toDrive(
+    collection=allFeatures,
+    description=fileName,
+    fileFormat='CSV',
+    folder='Earthengine_exports'
+  )
+  task.start()
+```

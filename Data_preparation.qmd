@@ -1,0 +1,139 @@
+---
+title: "Data preparation"
+format: html
+---
+
+## Libraries
+```{r}
+pacman::p_load(tidyverse, sf, terra, tidyterra, data.table, tidytable, RPostgres, DBI)
+```
+
+## Settings
+```{r}
+source("con.r")
+```
+
+## Steps
+### Dissolve overlapping polygons
+### Upload to Postgresql
+### Calculation of geometric properties
+First separate (explode) the original spatial data and get the WDPAIDs and centroids per polygon
+```{r}
+# Create view
+dbExecute(
+    con,
+    "CREATE OR REPLACE VIEW admin.land_exploded_jan2025
+ AS
+ SELECT t.wdpaid,
+    d.geometry,
+    st_envelope(d.geometry) AS bbox
+   FROM wdpa_poly_jan2025 t,
+    LATERAL st_dump(t.geometry) d(path, geometry)"
+)
+
+# Create materialized view
+dbExecute(
+    con,
+    "CREATE MATERIALIZED VIEW IF NOT EXISTS public.wdpa_exploded_jan2025_0
+TABLESPACE pg_default
+AS
+ SELECT * FROM admin.land_exploded_jan2025
+WITH NO DATA"
+)
+
+# Refresh the materialized view to populate it with data
+dbExecute(con, "REFRESH MATERIALIZED VIEW public.wdpa_exploded_jan2025_0")
+
+# Create spatial indexes
+dbExecute(
+    con,
+    "CREATE INDEX IF NOT EXISTS idx_wdpa_exploded_jan2025_0_geom
+ON public.wdpa_exploded_jan2025_0
+USING GIST (geometry)"
+)
+
+dbExecute(
+    con,
+    "CREATE INDEX IF NOT EXISTS idx_wdpa_exploded_jan2025_0_bbox
+ON public.wdpa_exploded_jan2025_0
+USING GIST (bbox)"
+)
+```
+
+Add the WDPAIDs to the previously dissolved polygons.
+```{r}
+# Create view
+dbExecute(
+    con,
+    "CREATE OR REPLACE VIEW admin.land_dissolved_wdpaid_join
+ AS
+ SELECT dis.fid,
+    id.wdpaid,
+    dis.geometry
+   FROM \"wdpaJan2025_land_dissolved\" dis
+     LEFT JOIN wdpa_exploded_jan2025_0 id 
+     ON st_makevalid(dis.geometry) && id.bbox 
+     AND st_intersects(st_makevalid(dis.geometry), st_makevalid(id.geometry));"
+)
+
+# Create materialized view
+dbExecute(
+    con,
+    "CREATE MATERIALIZED VIEW IF NOT EXISTS public.wdpa_dissolved_polygons_1
+ AS
+ SELECT * FROM admin.land_dissolved_wdpaid_join
+WITH NO DATA"
+)
+
+# Refresh the materialized view to populate it with data
+dbExecute(con, "REFRESH MATERIALIZED VIEW public.wdpa_dissolved_polygons_1")
+
+# Create spatial index
+dbExecute(
+    con,
+    "CREATE INDEX IF NOT EXISTS idx_wdpa_exploded_jan2025_0_geom
+ON public.wdpa_dissolved_polygons_1
+USING GIST (geometry)"
+)
+```
+
+Read the resulting table into R and assign polygons with multiple WDPAID to the most repeated WDPAID in every set.
+```{r}
+dbExecute(
+    con,
+    "CREATE OR REPLACE VIEW admin.land_dissolved_wdpaid_preselected AS
+WITH counts AS (
+    SELECT
+        fid,
+        wdpaid,
+        COUNT(*) OVER (PARTITION BY wdpaid) AS wdpaid_count
+    FROM wdpa_dissolved_polygons_1
+),
+ranked AS (
+    SELECT
+        fid,
+        wdpaid,
+        wdpaid_count,
+        ROW_NUMBER() OVER (
+            PARTITION BY fid
+            ORDER BY wdpaid_count DESC
+        ) AS rn
+    FROM counts
+)
+SELECT DISTINCT fid, wdpaid, geom
+FROM ranked
+WHERE rn = 1;
+"
+)
+
+dbExecute(
+    con,
+    "CREATE MATERIALIZED VIEW IF NOT EXISTS workdata_fin
+AS
+SELECT * FROM wdpaJan2025_land_dissolved d
+LEFT JOIN admin.land_dissolved_wdpaid_preselected v
+ON d.fid = v.fid
+WITH DATA"
+)
+
+```
