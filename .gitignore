@@ -48,4 +48,13 @@ po/*~
 # RStudio Connect folder
 rsconnect/
 
-rds_backups
+rds_backups/
+figures/
+*.gpkg
+*.gdb
+*.gdbindex
+*.shp
+*.shx
+*.prj
+*.cpg
+*.dbf
