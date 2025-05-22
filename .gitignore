@@ -58,3 +58,6 @@ figures/
 *.prj
 *.cpg
 *.dbf
+partial_plots (1).qmd
+Qgis_dissolve.sh
+.vscode/settings.json
