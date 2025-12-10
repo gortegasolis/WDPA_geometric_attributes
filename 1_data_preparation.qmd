@@ -1,7 +1,18 @@
 ---
 title: "Data preparation"
+Author: "Gabriel Ortega-Solís"
 format: html
 ---
+## Overview
+This script collects and prepares all the data required for the analysis of the geometric attributes of protected areas. It includes loading necessary libraries, reading and processing various datasets (climate, landcover, NDVI, elevation), calculating additional variables, and merging all datasets into a final dataframe ready for analysis.
+
+#### Libraries
+```{r}
+pacman::p_load(tidyverse, vegan, sf, GeoThinneR, parallel)
+```
+
+### Unzip data files
+
 ```{python}
 !rm -rf /tmp/data
 !mkdir -p /tmp/data
@@ -15,16 +26,11 @@ format: html
 !unzip Data/ecoregions.zip -d /tmp/ecoregions
 ```
 
-### Data preparation
-#### Libraries
+### Import datasets
 ```{r}
-pacman::p_load(tidyverse, vegan, sf, GeoThinneR, parallel)
-```
-
-
-```{r}
+cores <- 20
 climate <- list.files("/tmp/data/", full.names = T, pattern = "climate_analysis") %>%
-    mclapply(., read_csv, mc.cores = 10) %>%
+    mclapply(., read_csv, mc.cores = cores) %>%
     data.table::rbindlist(fill = T) %>%
     select(-1, -.geo) %>%
     filter(is.na(climate_histogram)) %>%
@@ -35,7 +41,7 @@ climate <- list.files("/tmp/data/", full.names = T, pattern = "climate_analysis"
     summarise(across(everything(), mean, na.rm = TRUE))
 
 landcover <- list.files("/tmp/data/", full.names = T, pattern = "landcover_stats") %>%
-    mclapply(., read_csv, mc.cores = 10) %>%
+    mclapply(., read_csv, mc.cores = cores) %>%
     data.table::rbindlist(fill = T) %>%
     select(-1, -.geo) %>%
     mutate(WDPAID = as.factor(wdpaid)) %>%
@@ -44,37 +50,41 @@ landcover <- list.files("/tmp/data/", full.names = T, pattern = "landcover_stats
     summarise(across(everything(), mean, na.rm = TRUE))
 
 ndvi <- list.files("/tmp/data/", full.names = T, pattern = "mean_sd_NDVI") %>%
-    mclapply(., read_csv, mc.cores = 10) %>%
+    mclapply(., read_csv, mc.cores = cores) %>%
     data.table::rbindlist(fill = T) %>%
     select(-1, -.geo) %>%
     mutate(WDPAID = as.factor(WDPAID))
 
+skip_cols <- c("id_1", "fixed")
 data <- read_csv("Data/output_geometric_attributes.csv") %>%
+    select(-all_of(skip_cols)) %>%
     mutate(ns_elongation = ns_length / ew_length) %>%
     rename(A = area) %>%
-    left_join(read_csv("Data/output_buffer_neg_100m.csv", col_types = cols(id_1 = col_skip(), fixed = col_skip())), by = "wdpaid") %>%
+    left_join(read_csv("Data/output_buffer_neg_100m.csv") %>% select(-all_of(skip_cols)), by = "wdpaid") %>%
     rename(neg100 = area) %>%
-    left_join(.,read_csv("Data/output_buffer_neg_500m.csv", col_types = cols(id_1 = col_skip(), fixed = col_skip())), by = "wdpaid") %>%
+    left_join(., read_csv("Data/output_buffer_neg_500m.csv") %>% select(-all_of(skip_cols)), by = "wdpaid") %>%
     rename(neg500 = area) %>%
-    left_join(.,read_csv("Data/output_buffer_neg_1000m.csv", col_types = cols(id_1 = col_skip(), fixed = col_skip())), by = "wdpaid") %>%
+    left_join(., read_csv("Data/output_buffer_neg_1000m.csv") %>% select(-all_of(skip_cols)), by = "wdpaid") %>%
     rename(neg1000 = area) %>%
-    left_join(.,read_csv("Data/output_buffer_neg_2000m.csv", col_types = cols(id_1 = col_skip(), fixed = col_skip())), by = "wdpaid") %>%
-    left_join(.,read_csv("Data/output_elevation.csv", col_types = cols(id_1 = col_skip(), fixed = col_skip())), by = "wdpaid") %>%
+    left_join(., read_csv("Data/output_buffer_neg_2000m.csv") %>% select(-all_of(skip_cols)), by = "wdpaid") %>%
+    left_join(., read_csv("Data/output_elevation.csv") %>% select(-all_of(skip_cols)), by = "wdpaid") %>%
     rename(neg2000 = area) %>%
     rename(WDPAID = wdpaid, area = A) %>%
     mutate(WDPAID = as.factor(WDPAID)) %>%
-    mutate(edge100m = area - neg100,
-           edge500m = area - neg500,
-           edge1000m = area - neg1000,
-           edge2000m = area - neg2000,
-           elevation_range = elevation_max - elevation_min,
-           elevation_cv = elevation_sd / elevation_mean
+    mutate(
+        edge100m = area - neg100,
+        edge500m = area - neg500,
+        edge1000m = area - neg1000,
+        edge2000m = area - neg2000,
+        elevation_range = elevation_max - elevation_min,
+        elevation_cv = elevation_sd / elevation_mean
     ) %>%
     mutate(edge_prop = edge1000m / area)
 
 nrow(data)
 length(unique(data$WDPAID))
 names(data)
+sapply(data, function(x) sum(is.na(x))) %>% sort(decreasing = TRUE)
 ```
 
 #### Climate
@@ -83,7 +93,11 @@ names(data)
 # Process the climate data
 cols <- paste0("cl", as.character(c(1:30)))
 
-colnames(climate) <- colnames(climate) %>% mgsub::mgsub(., pattern = as.character(c(1:30)), replacement = cols)
+if (any(str_detect(colnames(climate), "^cl\\d+$"))) {
+    cat("Column names already formatted.\n")
+} else {
+    colnames(climate) <- colnames(climate) %>% mgsub::mgsub(., pattern = as.character(c(1:30)), replacement = cols)
+}
 
 climate$shannon_climates <- apply(climate[, cols], 1, function(x) {
     x <- x[x > 0] # Remove zero values
@@ -100,13 +114,14 @@ climate$inv_simpson_climates <- apply(climate[, cols], 1, function(x) {
     vegan::diversity(x, index = "invsimpson")
 })
 
-climate$n_climates <- specnumber(climate[, cols])
+climate$n_climates <- vegan::specnumber(climate[, cols])
 
 climate$Pielou_climates <- climate$shannon_climates / log(climate$n_climates)
 
 climate$simpson_evenness_climate <- climate$inv_simpson_climates / climate$n_climates
 
 length(unique(climate$WDPAID)) == nrow(climate)
+sapply(climate, function(x) sum(is.na(x))) %>% sort(decreasing = TRUE)
 ```
 
 #### Landcover
@@ -115,7 +130,11 @@ length(unique(climate$WDPAID)) == nrow(climate)
 # Process the landcover data
 cols <- paste0("lc", c("20", "30", "40", "60", "70", "80", "90", "100", "111", "112", "113", "114", "115", "116", "121", "122", "123", "124", "125", "126"))
 
-colnames(landcover) <- colnames(landcover) %>% mgsub::mgsub(., pattern = c("20", "30", "40", "60", "70", "80", "90", "100", "111", "112", "113", "114", "115", "116", "121", "122", "123", "124", "125", "126"), replacement = cols)
+if (any(str_detect(colnames(landcover), "^lc\\d+$"))) {
+    cat("Column names already formatted.\n")
+} else {
+    colnames(landcover) <- colnames(landcover) %>% mgsub::mgsub(., pattern = c("20", "30", "40", "60", "70", "80", "90", "100", "111", "112", "113", "114", "115", "116", "121", "122", "123", "124", "125", "126"), replacement = cols)
+}
 
 landcover$shannon_landcover <- apply(landcover[, cols], 1, function(x) {
     x <- x[x > 0] # Remove zero values
@@ -132,13 +151,14 @@ landcover$inv_simpson_landcover <- apply(landcover[, cols], 1, function(x) {
     vegan::diversity(x, index = "invsimpson")
 })
 
-landcover$n_landcover <- specnumber(landcover[, cols])
+landcover$n_landcover <- vegan::specnumber(landcover[, cols])
 
 landcover$Pielou_landcover <- landcover$shannon_landcover / log(landcover$n_landcover)
 
 landcover$simpson_evenness_landcover <- landcover$inv_simpson_landcover / landcover$n_landcover
 
 length(unique(landcover$WDPAID)) == nrow(landcover)
+sapply(landcover, function(x) sum(is.na(x))) %>% sort(decreasing = TRUE)
 ```
 
 #### Built space
@@ -177,6 +197,8 @@ ndvi <- ndvi %>%
     )
 
 length(unique(ndvi$WDPAID)) == nrow(ndvi)
+nrow(ndvi)
+sapply(ndvi, function(x) sum(is.na(x))) %>% sort(decreasing = TRUE)
 ```
 
 #### Add continents and biomes

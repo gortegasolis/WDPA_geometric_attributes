@@ -61,3 +61,5 @@ figures/
 partial_plots (1).qmd
 Qgis_dissolve.sh
 .vscode/settings.json
+.env
+Data/data.zip
