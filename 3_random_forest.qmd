@@ -1,0 +1,629 @@
+### Random forest
+
+# Libraries
+
+```{r}
+pacman::p_load(tidymodels, tidyverse, future, doRNG, GGally, tictoc, pdp, foreach, doParallel, ranger, caret, GGally, ggcorrplot, corrr, hstats)
+```
+
+## Data
+
+Define predictors, exclusions and responses for further analyses
+
+```{r}
+source("predictors_and_responses.r")
+names(readRDS("Data/wdpa.rds"))
+```
+
+## Model settings
+
+```{r}
+# Re-import dataset
+exclude <- c("decimallongitude", "decimallatitude", "built_space", "realm", "X", "Y", "Z")
+
+data <- readRDS("Data/wdpa.rds") %>%
+    select(all_of(c("WDPAID", responses, predictors[!predictors %in% exclude]))) %>%
+    recipe(~.) %>%
+    step_naomit() %>%
+    step_filter(area > 1, continent != "Antarctica") %>%
+    prep() %>%
+    bake(new_data = NULL)
+
+# Remove NAs
+data <- na.omit(data)
+
+# Check that the pre-processing didn't deleted all the data
+if (nrow(data) > 0) {
+    nrow(data)
+} else {
+    stop("Data preprocessing resulted in an empty dataset.")
+}
+
+# Check NAs per column
+sapply(data, function(x) sum(is.na(x)))
+
+set.seed(20240626)
+split_prop <- 3 / 4
+ml_engine <- "ranger"
+ml_mode <- "regression"
+ml_metrics <- metric_set(rmse, rsq, mae)
+
+my_sapply <- function(X, FUN, ...) {
+    sapply(X, FUN, ..., simplify = FALSE, USE.NAMES = TRUE)
+}
+
+```
+
+# Create the model
+
+```{r}
+ml_model <-
+    # specify that the model is a random forest
+    rand_forest() %>%
+    # Parameters to be tuned
+    set_args(
+        mtry = tune(),
+        trees = tune(),
+        min_n = tune()
+    ) %>%
+    # Select the modeling engine
+    set_engine(engine = ml_engine, importance = "permutation") %>%
+    # Select between regression and binary classification
+    set_mode(ml_mode)
+```
+
+## Tuning parameters:
+
+```{r}
+npred <- length(predictors[!predictors %in% exclude])
+tuning_params <- expand.grid(
+    mtry = floor(c(sqrt(npred) / 2, sqrt(npred), 2 * sqrt(npred), npred / 3)), # number predictors
+    trees = c(100, 10 * npred, seq(500, 2000, by = 500)), # Number of trees
+    min_n = c(2, 5, 10, 15) # Minimum number of samples required to split an
+) %>% unique()
+
+nrow(tuning_params)
+```
+
+## Preparing training and testing data
+
+```{r}
+ml_data <- select(data, any_of(c(responses, predictors)))
+set.seed(2019820787)
+ml_split <- initial_split(ml_data, prop = split_prop)
+
+ml_split
+
+ml_train <- training(ml_split)
+ml_test <- testing(ml_split)
+ml_kfold <- vfold_cv(ml_train)
+```
+
+## Create recipe
+
+```{r}
+# https://recipes.tidymodels.org/articles/Ordering.html
+
+ml_recipes <- my_sapply(responses, function(y) {
+    if (y %in% c("elevation_cv","n_climates","shannon_climates")) {
+        exclude <- c(exclude, "edge_prop")
+    }
+    pred <- paste(predictors[!predictors %in% exclude],
+        collapse = "+"
+    )
+    formula <- as.formula(str_glue("{y} ~ {pred}"))
+    print(formula)
+    ml_recipe <- recipe(formula, data = ml_train) %>%
+        # Pre-processing steps
+        ## Transform numeric predictors
+        # step_YeoJohnson(all_numeric()) %>%
+        step_log(area, base = 10) %>%
+        # Handle unseen levels in categorical variables
+        step_novel(all_nominal()) %>%
+        ## Recode categorical variables
+        step_dummy(all_nominal()) %>%
+        ## Standardize all numeric columns
+        # step_normalize(all_numeric()) %>%
+        # Remove NAs
+        step_naomit()
+
+    return(ml_recipe)
+})
+```
+
+## Create a workflow
+
+```{r}
+ml_workflows <- my_sapply(names(ml_recipes), function(recipe) {
+    ml_workflow <- workflow() %>%
+        # add the recipe
+        add_recipe(ml_recipes[[recipe]]) %>%
+        # add the model
+        add_model(ml_model)
+})
+```
+
+## Tune parameters
+
+```{r}
+ntuning <- nrow(tuning_params)
+nlimit <- 100
+plan("future::multisession",
+    workers = ifelse(ntuning < nlimit, ntuning, nlimit)
+)
+
+# extract results
+ml_tune_results <- my_sapply(names(ml_workflows), function(workflow) {
+    try({
+        ml_workflows[[workflow]] %>%
+            tune_grid(
+                # Cross-validation data object
+                resamples = ml_kfold,
+                # Grid of hyperparameters
+                grid = tuning_params,
+                # Metrics to evaluate
+                metrics = ml_metrics
+            )
+    })
+})
+
+saveRDS(ml_tune_results, "rds_backups/ml_tune_results.rds")
+```
+
+## Plot tunned parameters
+
+```{r}
+# Re-import tuning results
+ml_tune_results <- readRDS("rds_backups/ml_tune_results.rds")
+
+# Generate and display plots for each element in ml_tune_results
+lapply(ml_tune_results, function(x) {
+    try({
+        autoplot(x) + ggtitle("Tuning Results")
+    })
+})
+```
+
+## Collect and evaluate results
+
+```{r}
+#| eval: true
+ml_tune_results <- my_sapply(names(ml_tune_results), function(x) {
+    try({
+        select_best(ml_tune_results[[x]], metric = "rmse")
+    })
+})
+
+print(ml_tune_results)
+```
+
+## Finalize workflow
+
+```{r}
+#| eval: true
+for (x in 1:length(ml_workflows)) {
+    try({
+        ml_workflows[[x]] <- finalize_workflow(
+            ml_workflows[[x]],
+            ml_tune_results[[x]]
+        )
+    })
+}
+```
+
+# Fit the final model to the training and testing data
+
+```{r}
+#| eval: true
+ml_fits <- mclapply(ml_workflows, function(workflow) {
+    try({
+        workflow %>%
+            # fit on the training set and evaluate on test set
+            last_fit(ml_split)
+    })
+}, mc.cores = 10)
+```
+
+check results
+
+```{r}
+test_performance <- mclapply(ml_fits, function(ml_fit) {
+    try({
+        ml_fit %>% collect_metrics()
+    })
+}, mc.cores = 10)
+
+names(test_performance) <- responses
+
+test_performance <- bind_rows(test_performance, .id = "Response")
+
+test_performance <- test_performance %>%
+    select(Response, .metric, .estimate) %>%
+    pivot_wider(names_from = .metric, values_from = .estimate)
+
+test_performance
+```
+
+### Variable importance plots
+
+```{r}
+pacman::p_load(vip, patchwork, dplyr, ggplot2, ggnewscale, ggpubr, tagger)
+
+n_impvars <- 5
+
+names(ml_fits) <- responses
+
+extract_varimportance <- function(model, response, num_features = 15) {
+    rsq <- test_performance %>%
+        filter(Response == response) %>%
+        pull(rsq)
+    f_model <- extract_fit_parsnip(model)
+    importance_scores <- vip(f_model$fit, num_features = num_features, geom = "col")$data
+    rsq <- round(rsq, 2)
+    importance_scores <- importance_scores %>%
+        mutate(std_importance = (Importance * rsq) / sum(Importance)) %>%
+        mutate(Response = str_glue("{response}~(R^2 == {rsq})")) # Add response variable for faceting
+    return(importance_scores)
+}
+
+# Extract importance scores for all models and combine into a single dataframe
+vip_data <- bind_rows(lapply(names(ml_fits), function(response) {
+    extract_varimportance(ml_fits[[response]], response)
+}))
+
+# Plot variable importance with facets and merged x axes, colored by importance (scaled per facet)
+vip_data <- vip_data %>%
+    group_by(Response) %>%
+    mutate(
+        rank = rank(-std_importance, ties.method = "min"),
+        fill_color = ifelse(rank <= n_impvars, "top5", "other")
+    ) %>%
+    ungroup()
+
+levels <- lapply(responses, function(x) {
+    vector <- unique(vip_data$Response)
+    str_subset(vector, x) # Directly return matches as character vector
+}) %>%
+    unlist(use.names = FALSE) %>% # Combine all matches, remove list structure
+    unique()
+
+levels <- str_replace_all(levels, c(
+    "cv_ndvi" = "CV-NDVI",
+    "elevation_cv" = "CV-ELEV",
+    "\\bn_climates" = "N-CLIM",
+    "shannon_climates" = "DIV-CLIM",
+    "\\bn_landcover" = "N-LC",
+    "shannon_landcover" = "DIV-LC"
+))
+
+vip_data$Response <- str_replace_all(vip_data$Response, c(
+    "cv_ndvi" = "CV-NDVI",
+    "elevation_cv" = "CV-ELEV",
+    "\\bn_climates" = "N-CLIM",
+    "shannon_climates" = "DIV-CLIM",
+    "\\bn_landcover" = "N-LC",
+    "shannon_landcover" = "DIV-LC"
+))
+
+vip_data$Response <- factor(vip_data$Response, levels = levels)
+
+vip_plot <- ggplot(vip_data, aes(x = reorder(Variable, std_importance), y = std_importance, fill = fill_color)) +
+    geom_col() +
+    coord_flip() +
+    facet_wrap(~Response, 
+        labeller = label_parsed,
+        axes = "all",
+        axis.labels = "margins") +
+    scale_fill_manual(values = c("top5" = "forestgreen", "other" = "lightblue")) +
+    labs(title = "", x = "", y = "") +
+    tag_facets(tag_levels = "a", tag_prefix = "(", tag_suffix = ")") +
+    expand_limits(y = -0.01) +
+    theme_pubr() +
+    theme(
+        text = element_text(size = 14),
+        legend.position = "none",
+        strip.text = element_text(size = 14),
+        strip.background = element_blank(),
+        axis.title.x = element_blank(),
+        strip.placement = "outside",
+        tagger.panel.tag.text = element_text(size = 16, face = "bold")
+    )
+
+# Save the plot
+ggsave("figures/faceted_variable_importance_plots.svg",
+    plot = vip_plot, width = 19, height = 11.81, units = "in", dpi = 300, bg = "white"
+)
+```
+
+#### Interactions
+
+```{r}
+pacman::p_load(hstats, ggpubr, parallel, future.apply)
+
+names(ml_fits) <- responses
+
+plan(multisession, workers = 50)
+
+get_interactions <- function(model, fileid = NULL, background_data = NULL) {
+    # Calculate hstat
+    hstat <- hstats(model, X = background_data)
+
+    h2val <- hstat$h2$num / hstat$h2$denom
+    h2val <- round(h2val, 2)
+
+    saveRDS(hstat, file = str_glue("rds_backups/{fileid}_hstat.rds"))
+
+    plot_all <- plot(hstat, normalize = T, squared = T) +
+        labs(
+            title = "",
+            x = bquote("H² (normalized) =" ~ .(h2val)),
+            y = ""
+        ) +
+        theme_pubr() +
+        theme(
+            strip.background = element_blank()
+        )
+
+    ggsave(plot = plot_all, filename = str_glue("figures/{fileid}_all_interactions_strength.svg"), width = 45, height = 15, units = "cm")
+}
+
+# Run the loop
+# Pre-slice models and data outside the future_lapply call
+input_list <- sapply(names(ml_fits), function(response) {
+    # Extract the recipe and bake it
+    recipe <- extract_workflow(ml_fits[[response]]) %>% extract_recipe()
+    baked_data <- bake(recipe, new_data = ml_data)
+
+    # Extract the fitted model
+    model <- extract_fit_parsnip(ml_fits[[response]])
+
+    list(
+        model = model,
+        fileid = response,
+        background_data = baked_data %>% select(-all_of(response))
+    )
+}, USE.NAMES = T, simplify = F)
+
+# Then pass only the necessary slice to each worker (much lighter!)
+future_lapply(input_list, function(x) {
+    tryCatch(
+        get_interactions(
+            model = x$model,
+            fileid = x$fileid,
+            background_data = x$background_data
+        ),
+        error = function(e) {
+            stop(str_glue("Error in response {x$fileid}: {e$message}"))
+            NULL
+        }
+    )
+}, future.scheduling = TRUE, future.seed = TRUE)
+```
+
+#### Partial dependence plots
+
+```{r}
+pacman::p_load(vip, patchwork, tagger)
+
+plot_partial_dependence <- function(response, x_axis_var, interacting_var, background_data = NULL) {
+    f_model <- extract_fit_parsnip(ml_fits[[response]])
+    processed_train <- bake(prep(ml_recipes[[response]]), new_data = background_data)
+    # Generate partial dependence data
+    plot <- hstats::partial_dep(f_model$fit, v = x_axis_var, BY = interacting_var, X = processed_train)$data %>%
+        pivot_longer(cols = all_of(x_axis_var), names_to = "interacting_var", values_to = "interacting_var_value") %>%
+        mutate(response = response)
+
+    return(plot)
+}
+
+# Coefficient of variation of NDVI
+p1 <- plot_partial_dependence(
+    response = "cv_ndvi",
+    x_axis_var = "reock",
+    interacting_var = "area",
+    background_data = ml_train
+)
+
+p2 <- plot_partial_dependence(
+    response = "cv_ndvi",
+    x_axis_var = "fractaldimension",
+    interacting_var = "area",
+    background_data = ml_train
+)
+
+# Coefficient of variation of elevation
+p3 <- plot_partial_dependence(
+    response = "elevation_cv",
+    x_axis_var = "reock",
+    interacting_var = "area",
+    background_data = ml_train
+)
+
+p4 <- plot_partial_dependence(
+    response = "elevation_cv",
+    x_axis_var = "fractaldimension",
+    interacting_var = "area",
+    background_data = ml_train
+)
+
+# Number of climates
+p5 <- plot_partial_dependence(
+    response = "n_climates",
+    x_axis_var = "reock",
+    interacting_var = "area",
+    background_data = ml_train
+)
+
+p6 <- plot_partial_dependence(
+    response = "n_climates",
+    x_axis_var = "fractaldimension",
+    interacting_var = "area",
+    background_data = ml_train
+)
+
+# Shannon climates
+p7 <- plot_partial_dependence(
+    response = "shannon_climates",
+    x_axis_var = "reock",
+    interacting_var = "area",
+    background_data = ml_train
+)
+
+p8 <- plot_partial_dependence(
+    response = "shannon_climates",
+    x_axis_var = "fractaldimension",
+    interacting_var = "area",
+    background_data = ml_train
+)
+
+# Landcover categories
+p9 <- plot_partial_dependence(
+    response = "n_landcover",
+    x_axis_var = "reock",
+    interacting_var = "area",
+    background_data = ml_train
+)
+
+p10 <- plot_partial_dependence(
+    response = "n_landcover",
+    x_axis_var = "fractaldimension",
+    interacting_var = "area",
+    background_data = ml_train
+)
+
+# Shannon landcover diversity
+p11 <- plot_partial_dependence(
+    response = "shannon_landcover",
+    x_axis_var = "fractaldimension",
+    interacting_var = "area",
+    background_data = ml_train
+)
+
+p12 <- plot_partial_dependence(
+    response = "shannon_landcover",
+    x_axis_var = "reock",
+    interacting_var = "area",
+    background_data = ml_train
+)
+
+p13 <- plot_partial_dependence(
+    response = "shannon_landcover",
+    x_axis_var = "elongation",
+    interacting_var = "area",
+    background_data = ml_train
+)
+
+p <- rbind(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12) %>%
+    mutate(response = factor(response, levels = c("cv_ndvi", "elevation_cv", "n_climates", "shannon_climates", "n_landcover", "shannon_landcover")),
+           interacting_var = factor(interacting_var, levels = c("reock_index", "fractaldimension"))) %>%
+    ggplot(., aes(x = interacting_var_value, y = y, color = area)) +
+    geom_line() +
+    facet_grid(
+        response ~ interacting_var,
+        scales = "free",
+        axes = "all",
+        axis.labels = "margins",
+        labeller = as_labeller(c(
+            reock_index = "Reock index",
+            fractaldimension = "Fractal dimension",
+            cv_ndvi = "CV-NDVI",
+            elevation_cv = "CV-ELEV",
+            n_climates = "N-CLIM",
+            shannon_climates = "DIV-CLIM",
+            n_landcover = "N-LC",
+            shannon_landcover = "DIV-LC"
+        )),
+        switch = "both"
+    ) +
+    labs(color = "Area", y = "Partial dependence") +
+    tag_facets(tag_levels = "a", tag_prefix = "(", tag_suffix = ")") +
+    theme_pubr() +
+    theme(
+        text = element_text(size = 14),
+        legend.position = "right",
+        strip.text = element_text(size = 14),
+        strip.background = element_blank(),
+        axis.title.x = element_blank(),
+        strip.placement = "outside",
+        tagger.panel.tag.text = element_text(size = 16, face = "bold")
+    )
+
+ggsave("figures/partial_dependence_combined.svg",
+    plot = p, width = 11, height = 17, units = "in", dpi = 300, bg = "white"
+)
+
+```
+
+### Mapping residuals
+```{r}
+pacman::p_load(sf, ggspatial, rnaturalearth, rnaturalearthdata, ggplot2, ggnewscale, ggpubr, dplyr)
+
+data <- left_join(data, 
+readRDS("Data/wdpa.rds") %>% select(WDPAID, decimallongitude, decimallatitude), by = "WDPAID")
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+st_crs(world) <- 4326
+
+# Create a regular grid of points (lat/lon) covering the world extent
+bbox <- st_bbox(world)
+grid_sf <- st_make_grid(world, what = "polygons", cellsize = c(15, 15), square = TRUE) %>% 
+st_as_sf()
+
+pa_coords <- st_as_sf(data, coords = c("decimallongitude", "decimallatitude"), crs = 4326, remove = FALSE)
+
+rm(pred_all)
+for (x in names(ml_fits)) {
+    try({
+        # Extract the recipe and bake it
+        recipe <- extract_workflow(ml_fits[[x]]) %>% extract_recipe()
+        baked_data <- bake(recipe, new_data = data) %>%
+            mutate(WDPAID = data$WDPAID)
+
+        # Extract the fitted model
+        model <- extract_fit_parsnip(ml_fits[[x]])
+
+        # Predict on the entire dataset
+        predictions <- predict(model, new_data = baked_data) %>%
+            bind_cols(baked_data %>% select("WDPAID")) %>%
+            rename(!!paste0(x, "_predicted") := .pred)
+
+        if(exists("pred_all")) {
+            pred_all <- left_join(pred_all, predictions, by = "WDPAID", suffix = c("", paste0("_", x)))
+        } else {
+            pred_all <- predictions
+        }
+    })
+}
+
+data <- left_join(data, pred_all, by = "WDPAID")
+
+sf_data <- st_read("Data/Work_data_wdpa.gpkg") %>%
+filter(wdpaid %in% unique(data$WDPAID))
+
+sf_data$wdpaid <- as.factor(sf_data$wdpaid)
+
+sf_data <- left_join(sf_data, data, by = c("wdpaid" = "WDPAID"))
+
+for (x in names(ml_fits)) {
+    try({
+        temp <- sf_data
+        temp$residuals <- temp[[paste0(x, "_predicted")]] - temp[[x]]
+
+        # Plot residuals
+        p <- ggplot() +
+            geom_sf(data = world, fill = "lightgray", color = "white") +
+            geom_sf(data = temp, aes(fill = residuals), color = NA) +
+            geom_sf(data = grid_sf, color = "gray", size = 0.1, alpha = 0.5, fill = NA, lty = "dashed") +
+            scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+            labs(fill = "Residuals") +
+            theme_pubr() +
+            theme(
+            legend.position = "bottom"
+            ) +
+            coord_sf(crs = "+proj=moll +lon_0=0 +datum=WGS84 +units=m +no_defs")
+
+        ggsave(filename = str_glue("figures/{x}_residuals_map.svg"), plot = p, width = 10, height = 6, units = "in", dpi = 300)
+    })
+}
+```

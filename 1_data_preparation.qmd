@@ -1,0 +1,259 @@
+---
+title: "Data preparation"
+format: html
+---
+```{python}
+!rm -rf /tmp/data
+!mkdir -p /tmp/data
+!rm -rf /tmp/continents
+!mkdir -p /tmp/continents
+!rm -rf /tmp/ecoregions
+!mkdir -p /tmp/ecoregions
+!unzip Data/data.zip -d /tmp/data/
+!ls -l /tmp/data | wc -l
+!unzip Data/continents.zip -d /tmp/continents
+!unzip Data/ecoregions.zip -d /tmp/ecoregions
+```
+
+### Data preparation
+#### Libraries
+```{r}
+pacman::p_load(tidyverse, vegan, sf, GeoThinneR, parallel)
+```
+
+
+```{r}
+climate <- list.files("/tmp/data/", full.names = T, pattern = "climate_analysis") %>%
+    mclapply(., read_csv, mc.cores = 10) %>%
+    data.table::rbindlist(fill = T) %>%
+    select(-1, -.geo) %>%
+    filter(is.na(climate_histogram)) %>%
+    select(-WDPAID, -climate_histogram) %>%
+    rename(WDPAID = wdpaid) %>%
+    mutate(WDPAID = as.factor(WDPAID)) %>%
+    group_by(WDPAID) %>%
+    summarise(across(everything(), mean, na.rm = TRUE))
+
+landcover <- list.files("/tmp/data/", full.names = T, pattern = "landcover_stats") %>%
+    mclapply(., read_csv, mc.cores = 10) %>%
+    data.table::rbindlist(fill = T) %>%
+    select(-1, -.geo) %>%
+    mutate(WDPAID = as.factor(wdpaid)) %>%
+    select(-wdpaid) %>%
+    group_by(WDPAID) %>%
+    summarise(across(everything(), mean, na.rm = TRUE))
+
+ndvi <- list.files("/tmp/data/", full.names = T, pattern = "mean_sd_NDVI") %>%
+    mclapply(., read_csv, mc.cores = 10) %>%
+    data.table::rbindlist(fill = T) %>%
+    select(-1, -.geo) %>%
+    mutate(WDPAID = as.factor(WDPAID))
+
+data <- read_csv("Data/output_geometric_attributes.csv") %>%
+    mutate(ns_elongation = ns_length / ew_length) %>%
+    rename(A = area) %>%
+    left_join(read_csv("Data/output_buffer_neg_100m.csv", col_types = cols(id_1 = col_skip(), fixed = col_skip())), by = "wdpaid") %>%
+    rename(neg100 = area) %>%
+    left_join(.,read_csv("Data/output_buffer_neg_500m.csv", col_types = cols(id_1 = col_skip(), fixed = col_skip())), by = "wdpaid") %>%
+    rename(neg500 = area) %>%
+    left_join(.,read_csv("Data/output_buffer_neg_1000m.csv", col_types = cols(id_1 = col_skip(), fixed = col_skip())), by = "wdpaid") %>%
+    rename(neg1000 = area) %>%
+    left_join(.,read_csv("Data/output_buffer_neg_2000m.csv", col_types = cols(id_1 = col_skip(), fixed = col_skip())), by = "wdpaid") %>%
+    left_join(.,read_csv("Data/output_elevation.csv", col_types = cols(id_1 = col_skip(), fixed = col_skip())), by = "wdpaid") %>%
+    rename(neg2000 = area) %>%
+    rename(WDPAID = wdpaid, area = A) %>%
+    mutate(WDPAID = as.factor(WDPAID)) %>%
+    mutate(edge100m = area - neg100,
+           edge500m = area - neg500,
+           edge1000m = area - neg1000,
+           edge2000m = area - neg2000,
+           elevation_range = elevation_max - elevation_min,
+           elevation_cv = elevation_sd / elevation_mean
+    ) %>%
+    mutate(edge_prop = edge1000m / area)
+
+nrow(data)
+length(unique(data$WDPAID))
+names(data)
+```
+
+#### Climate
+
+```{r}
+# Process the climate data
+cols <- paste0("cl", as.character(c(1:30)))
+
+colnames(climate) <- colnames(climate) %>% mgsub::mgsub(., pattern = as.character(c(1:30)), replacement = cols)
+
+climate$shannon_climates <- apply(climate[, cols], 1, function(x) {
+    x <- x[x > 0] # Remove zero values
+    vegan::diversity(x, index = "shannon")
+})
+
+climate$gini_simpson_climates <- apply(climate[, cols], 1, function(x) {
+    x <- x[x > 0] # Remove zero values
+    vegan::diversity(x, index = "simpson")
+})
+
+climate$inv_simpson_climates <- apply(climate[, cols], 1, function(x) {
+    x <- x[x > 0] # Remove zero values
+    vegan::diversity(x, index = "invsimpson")
+})
+
+climate$n_climates <- specnumber(climate[, cols])
+
+climate$Pielou_climates <- climate$shannon_climates / log(climate$n_climates)
+
+climate$simpson_evenness_climate <- climate$inv_simpson_climates / climate$n_climates
+
+length(unique(climate$WDPAID)) == nrow(climate)
+```
+
+#### Landcover
+
+```{r}
+# Process the landcover data
+cols <- paste0("lc", c("20", "30", "40", "60", "70", "80", "90", "100", "111", "112", "113", "114", "115", "116", "121", "122", "123", "124", "125", "126"))
+
+colnames(landcover) <- colnames(landcover) %>% mgsub::mgsub(., pattern = c("20", "30", "40", "60", "70", "80", "90", "100", "111", "112", "113", "114", "115", "116", "121", "122", "123", "124", "125", "126"), replacement = cols)
+
+landcover$shannon_landcover <- apply(landcover[, cols], 1, function(x) {
+    x <- x[x > 0] # Remove zero values
+    vegan::diversity(x, index = "shannon")
+})
+
+landcover$gini_simpson_landcover <- apply(landcover[, cols], 1, function(x) {
+    x <- x[x > 0] # Remove zero values
+    vegan::diversity(x, index = "simpson")
+})
+
+landcover$inv_simpson_landcover <- apply(landcover[, cols], 1, function(x) {
+    x <- x[x > 0] # Remove zero values
+    vegan::diversity(x, index = "invsimpson")
+})
+
+landcover$n_landcover <- specnumber(landcover[, cols])
+
+landcover$Pielou_landcover <- landcover$shannon_landcover / log(landcover$n_landcover)
+
+landcover$simpson_evenness_landcover <- landcover$inv_simpson_landcover / landcover$n_landcover
+
+length(unique(landcover$WDPAID)) == nrow(landcover)
+```
+
+#### Built space
+```{r}
+landcover$built_space <- landcover$`50` / landcover$total_pixels
+```
+
+#### Elevation
+
+```{r}
+# elevation <- elevation %>%
+#     group_by(WDPAID) %>%
+#     summarise(across(everything(), mean)) %>%
+#     mutate(
+#         elevation_range = elevation_max - elevation_min,
+#         elevation_cv = elevation_stdDev / elevation_mean
+#     )
+# length(unique(elevation$WDPAID)) == nrow(elevation)
+```
+
+#### NDVI - EVI
+
+```{r}
+ndvi <- ndvi %>%
+    select(-year) %>%
+    group_by(WDPAID) %>%
+    summarise(
+        EVI_p90_mean = mean(EVI_p90_mean),
+        NDVI_p90_mean = mean(NDVI_p90_mean),
+        EVI_p90_stdDev = sqrt(mean(EVI_p90_stdDev^2)),
+        NDVI_p90_stdDev = sqrt(mean(NDVI_p90_stdDev^2))
+    ) %>%
+    mutate(
+        cv_evi = EVI_p90_stdDev / EVI_p90_mean,
+        cv_ndvi = NDVI_p90_stdDev / NDVI_p90_mean
+    )
+
+length(unique(ndvi$WDPAID)) == nrow(ndvi)
+```
+
+#### Add continents and biomes
+```{r}
+# Make coordinates object
+coords <- select(data, WDPAID, decimallongitude, decimallatitude) %>%
+    mutate(lon = decimallongitude, lat = decimallatitude) %>%
+    mutate(x = decimallongitude, y = decimallatitude) %>%
+    st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+    st_make_valid() %>%
+    unique()
+
+# Load continent and biome data
+continents <- st_read("/tmp/continents/continents.gdb")[, c("CONTINENT", "SHAPE")] %>%
+    rename(continent = CONTINENT, geometry = SHAPE) %>%
+    st_make_valid() %>%
+    st_transform(., st_crs(coords))
+
+plot(st_geometry(continents))
+points(st_geometry(coords), col = "red", pch = 20, cex = 0.5)
+
+biomes <- st_read("/tmp/ecoregions//wwf_ecoregions//wwf_terr_ecos.shp")[, c("REALM", "geometry")] %>%
+    rename(realm = REALM) %>%
+    st_make_valid() %>%
+    st_transform(., st_crs(coords))
+
+plot(st_geometry(biomes))
+points(st_geometry(coords), col = "red", pch = 20, cex = 0.5)
+
+# Use st_join with prepared spatial indexes for faster joins
+coords <- coords %>% st_join(continents, join = st_intersects)
+coords <- coords %>% st_join(biomes, join = st_intersects)
+
+length(unique(coords$WDPAID)) == nrow(coords)
+```
+
+
+#### Latitude and longitude to cartesian coordinates
+
+```{r}
+# Apply lat-long transformation into cartesian coordinates
+geo2cartesian <- function(data, lat, lon) {
+    xyz <- lon_lat_to_cartesian(lat = data[[lat]], lon = data[[lon]])
+    data[[lon]] <- xyz[, 1] # First column is x
+    data[[lat]] <- xyz[, 2] # Second column is y
+    data$Z <- xyz[, 3] # Third column is z
+    return(data)
+}
+
+coords <- geo2cartesian(coords, lat = "y", lon = "x")
+
+length(unique(coords$WDPAID)) == nrow(coords)
+```
+
+### Merge all datasets
+
+```{r}
+# Perform joins, handle missing values and calculate additional variables
+final_data <- data %>%
+    left_join(climate, by = "WDPAID") %>%
+    left_join(landcover, by = "WDPAID") %>%
+    left_join(ndvi, by = "WDPAID") %>%
+    left_join(select(coords, -decimallatitude, -decimallongitude), by = "WDPAID") %>%
+    mutate(
+        ns_elongation = ns_length / ew_length,
+        WDPAID = as.character(WDPAID)
+    ) %>%
+    select(-fixed, -Pielou_landcover, -matches("^lc\\d"), -matches("^cl\\d"))
+
+# Check NAs per column
+na_counts <- sapply(final_data, function(x) sum(is.na(x))) %>% sort(decreasing = TRUE)
+print(na_counts)
+
+# Find duplicated WDPAIDs
+length(final_data$WDPAID[duplicated(final_data$WDPAID)])
+
+saveRDS(final_data, "Data/wdpa.rds")
+
+nrow(na.omit(final_data))
+```

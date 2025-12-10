@@ -1,0 +1,320 @@
+---
+title: "Principal components"
+format: html
+---
+
+## Analysis
+
+Define predictors and responses for further analyses
+```{r}
+source("predictors_and_responses.r")
+```
+
+-   Paired correlations
+```{r}
+data <- readRDS("Data/wdpa.rds")
+
+corr_plot_pred <- GGally::ggpairs(select(data, all_of(predictors[!predictors %in% c("continent","decimallongitude","decimallatitude")]))) +
+    ggpubr::theme_pubclean()
+
+ggsave(
+    str_glue("figures/corrplot_pred.svg"),
+    plot = corr_plot_pred,
+    width = 11.81, height = 11.81, units = "in", dpi = 300, bg = "white"
+)
+```
+
+-   Ordination with all attributes of protected areas.
+
+```{r}
+# Load required packages
+pacman::p_load(ggplot2, tidyverse, tidymodels, ggforce, rstatix, ggrepel, EFAtools, adegenet, geosphere, ggpubr, sf, future, spdep)
+
+# Re-import dataset
+data <- readRDS("Data/wdpa.rds") %>%
+    select(all_of(c("WDPAID", predictors[!predictors %in% c("built_space",
+        "X", "Y", "Z")]))) %>%
+    recipe(~.) %>%
+    step_naomit() %>%
+    step_filter(area > 1) %>%
+    step_scale(all_numeric(), -decimallongitude, -decimallatitude) %>%
+    step_YeoJohnson(all_numeric(), -decimallongitude, -decimallatitude) %>%
+    prep() %>%
+    bake(new_data = NULL) %>%
+    na.omit() %>%
+    filter(!continent %in% c("Antarctica")) %>%
+    cbind(., mahalanobis_distance(.[, !(names(.) %in% c("decimallongitude", "decimallatitude","continent","realm"))])[, c("mahal.dist", "is.outlier")]) %>%
+    filter(!is.outlier)
+
+# Check that the pre-processing didn't deleted all the data
+if (nrow(data) > 0) {
+    nrow(data)
+} else {
+    stop("Data preprocessing resulted in an empty dataset.")
+}
+
+# Check NAs per column
+sapply(data, function(x) sum(is.na(x)))
+
+# Run Bartlett's test of sphericity (must be significant)
+BARTLETT(select(data, !any_of(c("WDPAID", "continent", "realm", "mahal.dist", "is.outlier", "decimallongitude", "decimallatitude"))))
+```
+
+Run the spatial PCA
+```{r}
+# Prepare variables for spatial PCA
+spca_vars <- c(predictors[!predictors %in% c("WDPAID", "continent", "realm", "mahal.dist", "is.outlier","decimallongitude", "decimallatitude","built_space", "X", "Y", "Z")])
+
+print(spca_vars)
+
+X <- as.matrix(select(data, any_of(spca_vars)))
+
+# Use coordinates for spatial information
+coords <- select(data, decimallongitude, decimallatitude) %>%
+    st_as_sf(coords = c("decimallongitude", "decimallatitude"), crs = 4326) %>%
+    st_make_valid() %>%
+    st_transform(crs = '+proj=moll +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +units=m +no_defs') %>%
+    st_coordinates()
+
+# Use chooseCN to create a spatial weights list (k-nearest neighbors)
+nb <- chooseCN(coords, type = 6, k = 4, plot.nb = F, result.type = "listw")
+
+# Check if the neighbours seem reasonable (connecting protected areas but not crossing big oceans)
+## Do neighbours seem appropriate?
+svg("figures/neighbours_plot.svg", width = 10, height = 10)
+plot(nb, coords)
+dev.off()
+
+# Run spatial PCA (adegenet::spca)
+spca_res <- adegenet::spca(X, cn = nb, xy = coords, scannf = FALSE, nfposi = 4, nfnega = 4)
+
+# Check eigen values
+spca_res$eig
+
+# Set a future plan for parallel processing
+# future::plan("multisession", workers = 50)
+
+# # Save PCA summary in a separate future to avoid blocking
+# future::future({ 
+#     pca_summary <- summary(spca_res)
+#     saveRDS(pca_summary, "Data/pca_summary.rds")
+# })
+
+# Prepare data for ggplot: axes 1 and 2, with spatial filtering (e.g., color by continent or realm)
+ordination_df <- data %>%
+    mutate(
+        sPCA1 = spca_res$li[, 1],
+        sPCA2 = spca_res$li[, 2]
+    )
+
+# Calculate explained variance for each sPCA axis
+explained_var <- round(100 * spca_res$eig / sum(spca_res$eig), 2)
+
+# Calculate Moran's I for each sPCA axis (positive and negative)
+moran_list <- sapply(1:ncol(spca_res$li), function(i) {
+    moran.mc(spca_res$li[, i], nb, 999)$statistic
+})
+moran_list <- round(moran_list, 2)
+
+# Calculate variable loadings for sPCA axes 1 and 2
+loadings <- as.data.frame(spca_res$c1[, 1:2])
+loadings$variable <- rownames(loadings)
+colnames(loadings)[1:2] <- c("sPCA1", "sPCA2")
+
+# Scale loadings for plotting as arrows
+arrow_scale <- 2 # adjust as needed for visual clarity
+loadings$sPCA1 <- loadings$sPCA1 * arrow_scale
+loadings$sPCA2 <- loadings$sPCA2 * arrow_scale
+
+# Prepare axis labels with explained variance and Moran's *I*
+xlab <- glue::glue("PCA1 (σ²={explained_var[1]}%, Moran's *I* = {moran_list[1]})")
+ylab <- glue::glue("PCA 2 (σ²={explained_var[2]}%, Moran's *I* = {moran_list[2]})")
+
+# Use stat_density_2d with lower alpha and fewer bins to emphasize broader, more scattered regions
+loads_color <- "gray50"
+limits <- c(min(ordination_df$sPCA1, ordination_df$sPCA2) * 1.1, max(ordination_df$sPCA1, ordination_df$sPCA2) * 1.1)
+
+pca_plot <- ggplot(ordination_df, aes(x = sPCA1, y = sPCA2)) +
+    geom_point(alpha = 0.5, size = 1) +
+    stat_density_2d(
+        aes(fill = after_stat(level), group = continent),
+        geom = "polygon",
+        alpha = 1,
+        color = NA,
+        bins = 100,
+        h = c(0.5, 0.5)
+    ) +
+    scale_x_continuous(limits = limits) +
+    scale_y_continuous(limits = limits) +
+    scale_fill_viridis_c(option = "C") +
+    geom_segment(
+        data = loadings,
+        aes(x = 0, y = 0, xend = sPCA1, yend = sPCA2),
+        arrow = arrow(length = unit(0.25, "cm")),
+        color = loads_color,
+        inherit.aes = FALSE
+    ) +
+    geom_text_repel(
+        data = loadings,
+        aes(x = sPCA1, y = sPCA2, label = variable),
+        color = loads_color,
+        size = 3,
+        hjust = 0.5, vjust = -0.5,
+        inherit.aes = FALSE
+    ) +
+    labs(
+        title = "",
+        x = bquote(PCA[1] ~ "(σ²=" * .(explained_var[1]) * "%, Moran's " * italic(I) * "=" * .(moran_list[1]) * ")"),
+        y = bquote(PCA[2] ~ "(σ²=" * .(explained_var[2]) * "%, Moran's " * italic(I) * "=" * .(moran_list[2]) * ")"),
+        fill = "Density"
+    ) +
+    guides(
+        fill = guide_colorbar(title = "Density", title.position = "top", title.hjust = 0.5),
+        color = guide_legend(title = "", title.position = "top", title.hjust = 0.5)
+    ) +
+    theme_pubr() +
+    facet_wrap(~continent, ncol = 2) +
+    theme(
+        legend.position = "right",
+        strip.background = element_blank(),
+        strip.text = element_text(hjust = 0)
+    )
+
+ggsave("figures/spca_plot.svg", plot = pca_plot, width = 7.5, height = 10.5, units = "in", dpi = 300, bg = "white")
+```   
+
+Attempting network analysis
+```{r}
+# Load required packages for network analysis
+pacman::p_load(igraph, ggraph, tidygraph, networkD3, propagate, ff)
+
+# Load and prepare data as before
+network_vars <- c(predictors[!predictors %in% c("WDPAID", "continent", "realm", "mahal.dist", "is.outlier","decimallongitude", "decimallatitude","built_space", "X", "Y", "Z")])
+X <- as.matrix(dplyr::select(data, any_of(network_vars)))
+
+# Compute large correlation matrix, disk-backed
+correlation_matrix <- bigcor(t(X), size=1000, fun="cor") # bigcor or ff
+
+# Handle NA values and compute similarity directly on ff object
+correlation_matrix[is.na(correlation_matrix)] <- 0
+n <- nrow(correlation_matrix)
+
+# Compute threshold from upper triangle efficiently
+upper_vals <- ff(vmode="double", length=(n * (n - 1)) / 2)
+ind <- 1
+for(i in 1:(n-1)) {
+  for(j in (i+1):n) {
+    upper_vals[ind] <- abs(correlation_matrix[i, j])
+    ind <- ind + 1
+  }
+}
+threshold <- quantile(upper_vals[], 0.95)
+
+# Extract edges above threshold directly to file or data frame
+edge_file <- "Data/edge_list.csv"
+write.table(data.frame(from=integer(), to=integer(), weight=double()),
+            edge_file, row.names=FALSE, col.names=TRUE, sep=",")
+for(i in 1:(n-1)) {
+  for(j in (i+1):n) {
+    w <- abs(correlation_matrix[i, j])
+    if(w > threshold) {
+      write.table(data.frame(from=i, to=j, weight=w),
+                  edge_file, row.names=FALSE, col.names=FALSE, sep=",", append=TRUE)
+    }
+  }
+}
+```
+
+CONTINUAR DESDE AQUÍ PARA ABAJO EL 25/11 DEL ENTONCE
+
+```{r}
+# Load edge list and create igraph
+edges <- read.csv(edge_file)
+network_graph <- graph_from_data_frame(edges, directed=FALSE)
+```
+
+```{r}
+# Create igraph object
+network_graph <- graph_from_data_frame(edges, directed=FALSE)
+
+# Add node attributes
+V(network_graph)$continent <- sampled_data$continent
+V(network_graph)$realm <- sampled_data$realm
+V(network_graph)$area <- sampled_data$area
+V(network_graph)$WDPAID <- sampled_data$WDPAID
+
+# Only calculate essential centrality measures for large networks
+
+    V(network_graph)$degree <- degree(network_graph)
+    V(network_graph)$betweenness <- betweenness(network_graph, normalized = TRUE)
+    V(network_graph)$closeness <- closeness(network_graph, normalized = TRUE)
+    V(network_graph)$eigenvector <- eigen_centrality(network_graph)$vector
+    centrality_vars <- c("degree", "betweenness", "closeness", "eigenvector")
+
+layout_method <- "kk"  # Kamada-Kawai is faster for large networks
+
+# Create network plot with performance optimizations
+network_plot <- network_graph %>%
+    as_tbl_graph() %>%
+    ggraph(layout = layout_method) +
+    geom_edge_link(aes(alpha = weight), color = "gray80", width = 0.1) +  # Thinner edges
+    geom_node_point(aes(color = continent, size = degree), alpha = 0.6) +
+    scale_color_viridis_d(option = "plasma") +
+    scale_size_continuous(range = c(0.5, 2)) +  # Smaller node sizes
+    labs(
+        color = "Continent",
+        size = "Degree"
+    ) +
+    theme_graph() +
+    theme(
+        legend.position = "right",
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5)
+    )
+
+ggsave("figures/network_plot.svg", plot = network_plot, width = 12, height = 8, units = "in", dpi = 300, bg = "white")
+
+# Create centrality comparison plot with available measures
+centrality_df <- sampled_data %>%
+    select(WDPAID, continent)
+
+for (var in centrality_vars) {
+    centrality_df[[var]] <- vertex_attr(network_graph, var)
+}
+
+centrality_df <- centrality_df %>%
+    pivot_longer(cols = all_of(centrality_vars), 
+                 names_to = "centrality_measure", values_to = "value")
+
+centrality_plot <- ggplot(centrality_df, aes(x = continent, y = value, fill = continent)) +
+    geom_boxplot(alpha = 0.7) +
+    facet_wrap(~centrality_measure, scales = "free_y", ncol = 2) +
+    scale_fill_viridis_d(option = "plasma") +
+    labs(
+        title = "Network Centrality Measures by Continent",
+        x = "Continent",
+        y = "Centrality Value",
+        fill = "Continent"
+    ) +
+    theme_pubr() +
+    theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none",
+        strip.background = element_blank(),
+        strip.text = element_text(hjust = 0)
+    )
+
+ggsave("figures/centrality_plot.svg", plot = centrality_plot, width = 10, height = 8, units = "in", dpi = 300, bg = "white")
+
+# Print network summary statistics
+cat("Network Summary:\n")
+cat("Original dataset size:", nrow(data), "\n")
+cat("Sampled dataset size:", nrow(sampled_data), "\n")
+cat("Nodes:", vcount(network_graph), "\n")
+cat("Edges:", ecount(network_graph), "\n")
+cat("Density:", edge_density(network_graph), "\n")
+if (ecount(network_graph) > 0) {
+    cat("Average path length:", mean_distance(network_graph), "\n")
+    cat("Clustering coefficient:", transitivity(network_graph), "\n")
+}
+```
