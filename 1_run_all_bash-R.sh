@@ -34,9 +34,9 @@ parallel -a wdpaid.csv -j 50 --joblog parallel_buffer.log --timeout 900 Rscript 
 parallel -a wdpaid.csv -j 50 --joblog parallel_add_attributes.log --timeout 900 Rscript /home/ortega/Github/WDPA_geometric_attributes/scripts/add_geometric_attributes.R {}
 
 # Step 5: Get elevation
-parallel -a wdpaid.csv -j 10 --joblog parallel_add_attributes.log --timeout 900 --memfree 102400M Rscript /home/ortega/Github/WDPA_geometric_attributes/scripts/extract_elevation.R {}
+parallel -a wdpaid.csv -j 10 --joblog parallel_add_elevation.log --timeout 900 --memfree 102400M Rscript /home/ortega/Github/WDPA_geometric_attributes/scripts/extract_elevation.R {}
 
 # Step 6: Get climate
-parallel -a wdpaid.csv -j 50 --joblog parallel_add_attributes.log --timeout 900 --memfree 102400M Rscript /home/ortega/Github/WDPA_geometric_attributes/scripts/climate.R {}
+parallel -a wdpaid.csv -j 50 --joblog parallel_add_climate.log --timeout 900 --memfree 102400M Rscript /home/ortega/Github/WDPA_geometric_attributes/scripts/climate.R {}
 
 # Step 7: Join the layers
