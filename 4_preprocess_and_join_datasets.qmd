@@ -26,6 +26,40 @@ pacman::p_load(tidyverse, vegan, sf, GeoThinneR, parallel)
 !unzip Data/ecoregions.zip -d /tmp/ecoregions
 ```
 
+### Join Geopackage layers from previous scripts
+```{r}
+pacman::p_load(sf, tidyverse)
+layer_list <- st_layers("edge_bck/wdpa_wdpaid_10000.gpkg")$name
+layer_list
+
+wdpaids <- read.csv("edge_bck/wdpaid.csv",
+    header = FALSE
+)[[1]]
+
+lapply(layer_list, function(layer) {
+    result_df <- lapply(wdpaids, function(wdpaid) {
+        try({
+            df <- st_read(
+                str_glue("edge_bck/wdpa_wdpaid_{wdpaid}.gpkg"),
+                layer = layer
+            )
+        })
+        try({
+            df <- st_drop_geometry(df)
+        })
+        return(df)
+    }) %>%
+        # Keep only data.frames and remove NULL/error objects
+        .[sapply(., is.data.frame)] %>%
+        bind_rows()
+
+    # Write CSV file for this layer
+    write_csv(result_df, str_glue("Data/output_{layer}.csv"))
+
+    return(result_df)
+})
+```
+
 ### Import datasets
 ```{r}
 cores <- 20
