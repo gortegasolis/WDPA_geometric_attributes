@@ -39,4 +39,7 @@ parallel -a wdpaid.csv -j 10 --joblog parallel_add_elevation.log --timeout 900 -
 # Step 6: Get climate
 parallel -a wdpaid.csv -j 50 --joblog parallel_add_climate.log --timeout 900 --memfree 102400M Rscript /home/ortega/Github/WDPA_geometric_attributes/scripts/climate.R {}
 
-# Step 7: Join the layers
+# Step 7: Get landcover
+parallel -a wdpaid.csv -j 50 --joblog parallel_add_landcover.log --timeout 900 --memfree 102400M Rscript /home/ortega/Github/WDPA_geometric_attributes/scripts/landcover.R {}
+
+# Step 8: Join the layers
